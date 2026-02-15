@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict
 
 
 class Trainer:

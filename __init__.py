@@ -3,7 +3,12 @@
 __version__ = "0.1.0"
 __author__ = "Abhiram"
 
-from .api.main_enhanced import create_app
 from .modelss import MultimodalPredictor
 
+def create_app():
+    """Factory function to create FastAPI application."""
+    from .api.main_enhanced import app
+    return app
+
 __all__ = ["create_app", "MultimodalPredictor"]
+

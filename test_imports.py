@@ -73,7 +73,7 @@ except ImportError as e:
 # Test 8: Orchestrator
 print("\n[8/10] Testing orchestrator...")
 try:
-    from pipeline.orchestrator import PipelineOrchestrator
+    from pipeline.training_orchestrator import TrainingOrchestrator
     print("  ✅ Orchestrator imported")
 except ImportError as e:
     print(f"  ❌ Orchestrator import failed: {e}")
@@ -81,7 +81,7 @@ except ImportError as e:
 # Test 9: Model Registry
 print("\n[9/10] Testing model registry...")
 try:
-    from registry.model_registry import ModelRegistry
+    from model_registry_pkg.model_registry import ModelRegistry
     print("  ✅ Model registry imported")
 except ImportError as e:
     print(f"  ❌ Model registry import failed: {e}")
@@ -89,7 +89,7 @@ except ImportError as e:
 # Test 10: Data loader
 print("\n[10/10] Testing data loader...")
 try:
-    from data_ingestion.loader import DatasetLoader
+    from data_ingestion.loader import DataLoader
     print("  ✅ Data loader imported")
 except ImportError as e:
     print(f"  ❌ Data loader import failed: {e}")
