@@ -10,7 +10,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -90,6 +90,13 @@ session_ingested_hashes: Dict[str, Dict[str, Any]] = {}
 _MAX_ENGINES: int = 5
 _engine_cache: collections.OrderedDict[str, Any] = collections.OrderedDict()
 _engine_cache_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Async inference task store – eliminates 504 timeouts on large batches.
+# Thread-safe dict: task_id -> {status, result, error, created_at}
+# ---------------------------------------------------------------------------
+_TASK_STORE: Dict[str, Dict[str, Any]] = {}
+_task_store_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Training task progress tracking (background task + polling)
@@ -1490,7 +1497,170 @@ async def model_info(model_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Inference  (replaces the hardcoded mock response)
+# Async inference  (fire-and-poll pattern – eliminates 504 timeouts)
+# ---------------------------------------------------------------------------
+
+def _run_inference_task(
+    task_id: str,
+    model_id: str,
+    raw_inputs: List[Dict[str, Any]],
+    explain: bool,
+    target_class: int,
+    n_steps: int,
+) -> None:
+    """
+    Background worker that wraps the existing synchronous inference path.
+
+    Runs in a thread spawned by FastAPI BackgroundTasks.  Updates
+    ``_TASK_STORE[task_id]`` with PROCESSING → COMPLETED | FAILED so the
+    frontend can poll ``GET /task/{task_id}`` without blocking.
+    """
+    with _task_store_lock:
+        _TASK_STORE[task_id]["status"] = "PROCESSING"
+
+    try:
+        from pipeline.inference_enginee import MultimodalInferenceEngine
+
+        # Re-use cached engine (same LRU logic as /predict)
+        with _engine_cache_lock:
+            if model_id in _engine_cache:
+                _engine_cache.move_to_end(model_id)
+                engine = _engine_cache[model_id]
+            else:
+                engine = None
+
+        if engine is None:
+            engine = MultimodalInferenceEngine(model_id=model_id)
+            with _engine_cache_lock:
+                _engine_cache[model_id] = engine
+                while len(_engine_cache) > _MAX_ENGINES:
+                    _engine_cache.popitem(last=False)
+
+        df: pd.DataFrame = pd.DataFrame(raw_inputs)
+
+        # Core inference – identical to the synchronous /predict path
+        result: Dict[str, Any] = engine.predict_batch(df)
+
+        # XAI (optional)
+        explanations: Optional[Dict[str, Any]] = None
+        if explain:
+            effective_target: int = target_class
+            if target_class < 0:
+                preds = result.get("predictions", [])
+                confs = result.get("confidences", [])
+                if preds:
+                    first_pred = preds[0]
+                    if isinstance(first_pred, int):
+                        effective_target = first_pred
+                    elif isinstance(first_pred, list) and confs:
+                        first_conf = confs[0] if isinstance(confs[0], list) else confs
+                        effective_target = int(
+                            max(range(len(first_conf)), key=lambda i: first_conf[i])
+                        )
+                    else:
+                        effective_target = 0
+                else:
+                    effective_target = 0
+
+            explanations = engine.generate_explanations(
+                df, target_class=effective_target, n_steps=n_steps,
+            )
+
+        payload = {
+            "status":       "success",
+            "predictions":  result["predictions"],
+            "confidences":  result["confidences"],
+            "problem_type": result["problem_type"],
+            "n_samples":    result["n_samples"],
+            "explanations": explanations,
+        }
+
+        with _task_store_lock:
+            _TASK_STORE[task_id]["status"] = "COMPLETED"
+            _TASK_STORE[task_id]["result"] = payload
+
+    except Exception as exc:
+        logger.error("Background inference task %s failed: %s", task_id, exc, exc_info=True)
+        with _task_store_lock:
+            _TASK_STORE[task_id]["status"] = "FAILED"
+            _TASK_STORE[task_id]["error"] = str(exc)
+
+
+@app.post("/predict-async")
+async def predict_async(request: Request, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    """
+    Fire-and-return async inference.
+
+    Immediately returns ``{"task_id": "<uuid>"}``; the frontend polls
+    ``GET /task/{task_id}`` until status is COMPLETED or FAILED.
+    """
+
+    body: Dict[str, Any] = await request.json()
+
+    model_id: Optional[str] = body.get("model_id")
+    if not model_id:
+        raise HTTPException(status_code=400, detail="model_id is required.")
+
+    raw_inputs: List[Dict[str, Any]] = body.get("inputs", [])
+    if not raw_inputs:
+        raise HTTPException(status_code=400, detail="inputs list is empty.")
+    _MAX_BATCH: int = 10_000
+    if len(raw_inputs) > _MAX_BATCH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Batch too large ({len(raw_inputs)} rows). Maximum is {_MAX_BATCH}.",
+        )
+
+    explain: bool     = bool(body.get("explain", False))
+    target_class: int = int(body.get("target_class", -1))
+    n_steps: int      = int(body.get("n_steps", 50))
+
+    task_id: str = str(uuid.uuid4())
+    with _task_store_lock:
+        _TASK_STORE[task_id] = {
+            "status":     "PENDING",
+            "result":     None,
+            "error":      None,
+            "created_at": datetime.now().isoformat(),
+            "model_id":   model_id,
+            "n_samples":  len(raw_inputs),
+        }
+
+    background_tasks.add_task(
+        _run_inference_task,
+        task_id, model_id, raw_inputs, explain, target_class, n_steps,
+    )
+
+    return {"task_id": task_id, "status": "PENDING"}
+
+
+@app.get("/task/{task_id}")
+async def get_task_status(task_id: str) -> Dict[str, Any]:
+    """
+    Poll the status of an async inference task.
+
+    Returns the full prediction payload once COMPLETED, or an error
+    message if FAILED.
+    """
+    with _task_store_lock:
+        task = _TASK_STORE.get(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+
+    response: Dict[str, Any] = {
+        "task_id":    task_id,
+        "status":     task["status"],
+        "created_at": task.get("created_at"),
+    }
+    if task["status"] == "COMPLETED":
+        response["result"] = task["result"]
+    elif task["status"] == "FAILED":
+        response["error"] = task["error"]
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Inference  (synchronous – kept for backward compat, small batches)
 # ---------------------------------------------------------------------------
 
 @app.post("/predict")

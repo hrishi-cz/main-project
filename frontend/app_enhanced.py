@@ -1618,18 +1618,75 @@ def render_phase_7_prediction() -> None:
             "target_class": int(xai_target_class),
             "n_steps": int(xai_n_steps),
         }
-        with st.spinner("Running inference..."):
+
+        # ── Fire async task and poll until done ─────────────────────────────
+        with st.spinner("Submitting inference task..."):
             try:
-                resp = requests.post(f"{API_BASE_URL}/predict", json=payload, timeout=120)
+                submit_resp = requests.post(
+                    f"{API_BASE_URL}/predict-async", json=payload, timeout=30,
+                )
             except Exception as conn_exc:
                 st.error(f"Connection error: {conn_exc}")
                 return
 
-        if resp.status_code != 200:
-            st.error(f"API error {resp.status_code}: {resp.text}")
+        if submit_resp.status_code != 200:
+            st.error(f"API error {submit_resp.status_code}: {submit_resp.text}")
             return
 
-        result: Dict = resp.json()
+        task_id: str = submit_resp.json().get("task_id", "")
+        if not task_id:
+            st.error("No task_id returned from API.")
+            return
+
+        # Poll loop with progress feedback
+        progress_bar = st.progress(0, text="Inference running...")
+        poll_interval: float = 0.5  # seconds
+        max_polls: int = 600        # 5 minutes max
+        result: Optional[Dict] = None
+
+        import time as _time
+        for poll_i in range(max_polls):
+            _time.sleep(poll_interval)
+            # Gradually slow polling after initial burst
+            if poll_i > 10:
+                poll_interval = min(poll_interval * 1.1, 3.0)
+
+            try:
+                status_resp = requests.get(
+                    f"{API_BASE_URL}/task/{task_id}", timeout=10,
+                )
+            except Exception:
+                continue
+
+            if status_resp.status_code != 200:
+                continue
+
+            task_data = status_resp.json()
+            task_status = task_data.get("status", "PENDING")
+
+            if task_status == "PROCESSING":
+                progress_bar.progress(
+                    min(30 + poll_i, 95),
+                    text=f"Processing ({poll_i + 1}s)...",
+                )
+            elif task_status == "COMPLETED":
+                progress_bar.progress(100, text="Complete!")
+                result = task_data.get("result", {})
+                break
+            elif task_status == "FAILED":
+                progress_bar.empty()
+                st.error(f"Inference failed: {task_data.get('error', 'Unknown error')}")
+                return
+        else:
+            progress_bar.empty()
+            st.error("Inference timed out after 5 minutes. Check server logs.")
+            return
+
+        progress_bar.empty()
+
+        if not result:
+            st.error("No result returned.")
+            return
         predictions: List = result.get("predictions", [])
         confidences: List = result.get("confidences", [])
         problem_type: str = result.get("problem_type", "")
