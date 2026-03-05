@@ -48,3 +48,4 @@ nul
 
 # Documentation (auto-generated, not source of truth)
 *.md
+!README.md
