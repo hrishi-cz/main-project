@@ -43,4 +43,8 @@ Thumbs.db
 
 # Temp files
 tmpclaude-*/
+tmpclaude-*-cwd
 nul
+
+# Documentation (auto-generated, not source of truth)
+*.md
