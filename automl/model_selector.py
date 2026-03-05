@@ -1,30 +1,68 @@
-"""AutoML model selector for automatic model selection."""
+"""
+ModelSelector – thin deprecation wrapper around AdvancedModelSelector.
 
-import torch
-import torch.nn as nn
-from typing import List, Dict, Optional
+The old ``ModelSelector`` class contained its own encoder catalogue and
+selection logic that has been superseded by ``AdvancedModelSelector``.
+This module keeps the public surface alive to prevent import errors in
+any legacy callers while routing all work to the canonical implementation.
+
+New code should import ``AdvancedModelSelector`` directly::
+
+    from automl.advanced_selector import AdvancedModelSelector
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, Dict, List, Optional
+
+from automl.advanced_selector import AdvancedModelSelector, SelectionResult
+
+logger = logging.getLogger(__name__)
 
 
 class ModelSelector:
-    """Automatically selects the best model based on task and data characteristics."""
-    
-    def __init__(self):
-        self.models = {}
-        self.best_model = None
-    
-    def select_model(self, task: str, data_shape: Dict) -> str:
-        """Select appropriate model based on task type."""
-        if task == "classification":
-            return "multimodal_classifier"
-        elif task == "regression":
-            return "multimodal_regressor"
-        else:
-            return "multimodal_predictor"
-    
-    def register_model(self, name: str, model: nn.Module):
-        """Register a model in the selector."""
-        self.models[name] = model
-    
-    def get_model(self, name: str) -> Optional[nn.Module]:
-        """Retrieve registered model."""
-        return self.models.get(name)
+    """
+    Deprecated: delegates entirely to :class:`AdvancedModelSelector`.
+
+    The only method retained for backward compatibility is
+    ``recommend_models(problem_type, modalities)``, which is called by
+    the ``/select-model`` API endpoint.
+    """
+
+    def __init__(self) -> None:
+        self._delegate = AdvancedModelSelector()
+        logger.debug(
+            "ModelSelector: delegating to AdvancedModelSelector "
+            "(this class is deprecated)"
+        )
+
+    def recommend_models(
+        self,
+        problem_type: str,
+        modalities: List[str],
+        dataset_size: int = 10_000,
+        avg_tokens: int = 128,
+    ) -> List[Dict[str, Any]]:
+        """
+        Proxy for :meth:`AdvancedModelSelector.recommend_models`.
+
+        Returns a ranked list of model recommendation dicts that conform to
+        the Streamlit frontend JSON contract consumed by ``/select-model``.
+        """
+        return self._delegate.recommend_models(
+            problem_type=problem_type,
+            modalities=modalities,
+            dataset_size=dataset_size,
+            avg_tokens=avg_tokens,
+        )
+
+    def select_model(self, task: str, data_shape: Dict[str, Any]) -> str:
+        """Legacy stub – returns a descriptive model name string."""
+        modality_map = {
+            "classification": ["tabular"],
+            "regression":     ["tabular"],
+        }
+        modalities = modality_map.get(task, ["tabular"])
+        recs = self.recommend_models(task, modalities)
+        return recs[0]["name"] if recs else "multimodal_predictor"

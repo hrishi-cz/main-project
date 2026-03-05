@@ -1,411 +1,482 @@
-"""Advanced data ingestion with caching, hashing, and multi-source support."""
+"""
+Production-grade async data ingestion with DVC lineage, aiohttp concurrency,
+and per-URL fault isolation.
+"""
 
 import os
+import asyncio
 import hashlib
 import json
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
-from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import zipfile
 from datetime import datetime
-import requests
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
+import logging
+
+import aiohttp
+
+from data_ingestion.loader import DataLoader
+
+logger = logging.getLogger(__name__)
 
 
 class DataIngestionManager:
-    """Manages data ingestion with caching, validation, and multi-source support."""
-    
-    def __init__(self, cache_dir: str = "./data/dataset_cache"):
+    """
+    Async, production-grade data ingestion with:
+      - Concurrent multi-URL downloads via aiohttp + asyncio.gather
+      - Per-URL fault isolation (404 / conn errors caught, rest continue)
+      - SHA-256 cache keying to avoid redundant downloads
+      - DVC lineage: `dvc add <cache_path>` called after each successful cache write
+    """
+
+    def __init__(self, cache_dir: str = "./data/dataset_cache") -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_metadata = self._load_cache_metadata()
-    
-    def _load_cache_metadata(self) -> Dict:
-        """Load cache metadata."""
+        self._loader = DataLoader()
+        self.cache_metadata: Dict[str, Any] = self._load_cache_metadata()
+
+    # ------------------------------------------------------------------ #
+    # Cache helpers
+    # ------------------------------------------------------------------ #
+
+    def _load_cache_metadata(self) -> Dict[str, Any]:
         metadata_file = self.cache_dir / "cache_metadata.json"
         if metadata_file.exists():
-            with open(metadata_file, 'r') as f:
+            with open(metadata_file, "r", encoding="utf-8") as f:
                 return json.load(f)
         return {}
-    
-    def _save_cache_metadata(self):
-        """Save cache metadata."""
+
+    def _save_cache_metadata(self) -> None:
         metadata_file = self.cache_dir / "cache_metadata.json"
-        with open(metadata_file, 'w') as f:
-            json.dump(self.cache_metadata, f, indent=2)
-    
-    def _generate_hash(self, source: str) -> str:
-        """Generate SHA-256 hash of data source."""
-        hash_obj = hashlib.sha256(source.encode())
-        return hash_obj.hexdigest()[:16]  # Use first 16 chars
-    
-    def _is_kaggle_url(self, url: str) -> bool:
-        """Check if URL is Kaggle dataset."""
-        return "kaggle.com/datasets" in url
-    
-    def _download_file(self, url: str, output_path: Path, progress_callback=None) -> bool:
-        """Download file from URL with progress tracking."""
+        # Atomic write: temp file + os.replace prevents half-written JSON
+        # if the process crashes mid-write or concurrent ingestions race.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.cache_dir), suffix=".tmp"
+        )
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            total_size = int(response.headers.get('content-length', 0))
-            downloaded = 0
-            
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_callback and total_size > 0:
-                            progress = (downloaded / total_size) * 100
-                            progress_callback(progress)
-            
-            return True
-        except Exception as e:
-            print(f"Error downloading {url}: {e}")
-            return False
-    
-    def ingest_data(
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.cache_metadata, f, indent=2)
+            os.replace(tmp_path, str(metadata_file))
+        except BaseException:
+            # Clean up temp file on any failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _normalize_url(source: str) -> str:
+        """
+        Canonicalise a URL so that cosmetic variants produce the same hash.
+
+        Normalisation steps:
+          1. Strip leading/trailing whitespace
+          2. Remove trailing slashes
+          3. Lowercase the scheme + host (path is case-sensitive)
+          4. Remove ``www.`` prefix from host
+          5. Strip query params and fragments (they don't affect the dataset)
+          6. Kaggle shortcut: ``kaggle.com/datasets/<owner>/<name>`` is the
+             canonical form regardless of full-URL embellishments
+
+        Non-URL strings (local paths) are returned as-is after stripping.
+        """
+        source = source.strip()
+        if not source.startswith(("http://", "https://")):
+            # Local path — normalise slashes but keep case (Windows paths)
+            return source.replace("\\", "/").rstrip("/")
+        parsed = urlparse(source)
+        host = parsed.hostname or ""
+        host = host.lower().removeprefix("www.")
+        path = parsed.path.rstrip("/")
+        # Kaggle canonical form: just owner/dataset from the path
+        if "kaggle.com" in host and "/datasets/" in path:
+            parts = path.split("/datasets/", 1)
+            if len(parts) == 2:
+                dataset_slug = parts[1].strip("/")
+                return f"kaggle://datasets/{dataset_slug}"
+        return f"{parsed.scheme}://{host}{path}"
+
+    def _generate_hash(self, source: str) -> str:
+        """Generate a 16-char SHA-256 hex digest for a normalised source identifier."""
+        normalised = self._normalize_url(source)
+        return hashlib.sha256(normalised.encode()).hexdigest()[:16]
+
+    def _legacy_hash(self, source: str) -> str:
+        """Hash using the raw source string (pre-normalisation era)."""
+        return hashlib.sha256(source.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _is_kaggle_url(url: str) -> bool:
+        return "kaggle.com/datasets" in url
+
+    # ------------------------------------------------------------------ #
+    # DVC integration
+    # ------------------------------------------------------------------ #
+
+    def _dvc_add(self, cache_path: Path) -> None:
+        """
+        Register *cache_path* with DVC for data lineage via `dvc add`.
+        Failures are logged (not raised) so they never block ingestion.
+        """
+        try:
+            result = subprocess.run(
+                ["dvc", "add", str(cache_path)],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "dvc add failed for %s: %s", cache_path, result.stderr.strip()
+                )
+            else:
+                logger.info("DVC: tracked %s", cache_path)
+        except FileNotFoundError:
+            logger.info("DVC not installed – skipping lineage for %s", cache_path)
+        except Exception as exc:
+            logger.warning("dvc add error: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Public async API
+    # ------------------------------------------------------------------ #
+
+    async def ingest_data(
         self,
         sources: Union[str, List[str]],
-        progress_callback=None,
-        force_download: bool = False
-    ) -> Tuple[Dict[str, pd.DataFrame], Dict]:
+        force_download: bool = False,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """
-        Ingest data from multiple sources with caching.
-        
+        Concurrently ingest datasets from multiple sources.
+
         Args:
-            sources: Single URL/path or list of URLs/paths
-            progress_callback: Callback function for progress updates
-            force_download: Force download even if cached
-        
+            sources:        Single URL/path or list of URLs/paths.
+            force_download: Force re-download even when cached.
+
         Returns:
-            Tuple of (loaded_data_dict, metadata_dict)
+            Tuple:
+              - lazy_datasets : {source_hash -> LazyFrame | LazyImageDataset}
+              - metadata      : ingestion metadata dict (hashes, failures, timing)
         """
         if isinstance(sources, str):
             sources = [sources]
-        
-        loaded_data = {}
-        metadata = {
+
+        metadata: Dict[str, Any] = {
             "sources": sources,
             "ingestion_time": datetime.now().isoformat(),
             "cached_hashes": {},
-            "modalities": {},
-            "cache_status": {}  # Track which datasets were cached vs downloaded
+            "cache_status": {},
+            "failed": {},
         }
-        
-        for source in sources:
+
+        tasks = [self._ingest_single(source, force_download) for source in sources]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        lazy_datasets: Dict[str, Any] = {}
+        for source, result in zip(sources, results):
             source_hash = self._generate_hash(source)
-            cache_path = self.cache_dir / source_hash
-            
-            # Check cache
-            if source_hash in self.cache_metadata and not force_download:
-                if progress_callback:
-                    progress_callback(50, f"Loading cached data from {source_hash}")
-                
-                cached_data = self._load_cached_data(cache_path, source_hash)
-                if cached_data is not None:
-                    loaded_data[source_hash] = cached_data
-                    metadata["cached_hashes"][source] = source_hash
-                    metadata["cache_status"][source] = "cached"  # Track as cached
-                    if progress_callback:
-                        progress_callback(100, f"Loaded from cache: {source_hash}")
-                    continue
-            
-            # Cache miss or force download
-            if progress_callback:
-                progress_callback(10, f"Downloading from {source}")
-            
-            # Handle different source types
-            if self._is_kaggle_url(source):
-                data = self._ingest_kaggle(source, cache_path, progress_callback)
-            elif source.startswith(('http://', 'https://')):
-                data = self._ingest_remote_url(source, cache_path, progress_callback)
+            if isinstance(result, Exception):
+                metadata["failed"][source] = str(result)
+                logger.error("Ingestion failed for [%s]: %s", source, result)
+            elif result is None:
+                metadata["failed"][source] = "Ingestion returned no data"
+                logger.error("Ingestion returned None for [%s]", source)
             else:
-                data = self._ingest_local_path(source, cache_path, progress_callback)
-            
-            if data is not None:
-                loaded_data[source_hash] = data
+                lazy_ref, cache_path = result
+                lazy_datasets[source_hash] = lazy_ref
                 metadata["cached_hashes"][source] = source_hash
-                metadata["cache_status"][source] = "downloaded"  # Track as newly downloaded
-                
-                # Save to cache
-                self._save_to_cache(cache_path, source_hash, data, source)
-                
-                if progress_callback:
-                    progress_callback(100, f"Data ready from {source}")
-        
-        return loaded_data, metadata
-    
-    def _ingest_kaggle(self, url: str, cache_path: Path, progress_callback=None) -> Optional[pd.DataFrame]:
-        """Ingest Kaggle dataset using kaggle-api."""
-        try:
-            import subprocess
-            import os
-            import tempfile
-            
-            if progress_callback:
-                progress_callback(10, "Parsing Kaggle dataset URL...")
-            
-            # Extract dataset identifier from URL
-            # URL format: https://www.kaggle.com/datasets/{owner}/{dataset-name}
-            parts = url.strip('/').split('/')
-            if len(parts) < 2:
-                raise ValueError(f"Invalid Kaggle URL: {url}")
-            
-            dataset_id = f"{parts[-2]}/{parts[-1]}"
-            
-            if progress_callback:
-                progress_callback(20, f"Downloading: {dataset_id}")
-            
-            # Create temp directory for download
-            temp_dir = Path(tempfile.gettempdir()) / f"kaggle_{parts[-1]}"
-            temp_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Download dataset using kaggle CLI
-            try:
-                result = subprocess.run(
-                    ["kaggle", "datasets", "download", "-d", dataset_id, "-p", str(temp_dir)],
-                    capture_output=True,
-                    text=True,
-                    timeout=1800  # 30 minutes for large downloads
-                )
-                
-                if result.returncode != 0:
-                    if "401" in result.stderr or "Unauthorized" in result.stderr:
-                        raise Exception("Kaggle API key not found. Set up credentials at ~/.kaggle/kaggle.json")
-                    raise Exception(f"Kaggle download failed: {result.stderr}")
-                
-            except FileNotFoundError:
-                raise Exception("kaggle CLI not found. Install with: pip install kaggle")
-            
-            if progress_callback:
-                progress_callback(50, "Extracting archive...")
-            
-            # Find any downloaded files
-            all_files = list(temp_dir.glob("*"))
-            if not all_files:
-                raise Exception(f"Kaggle download returned no files. Check dataset ID: {dataset_id}")
-            
-            # Find and extract any zip files
-            import zipfile
-            zip_files = list(temp_dir.glob("*.zip"))
-            
-            if not zip_files:
-                # Check what was actually downloaded
-                file_list = [f.name for f in all_files]
-                raise Exception(f"Expected zip file from Kaggle, but got: {file_list}. Dataset may require login or be restricted.")
-            
-            for zip_file in zip_files:
-                try:
-                    with zipfile.ZipFile(zip_file, 'r') as zip_ref:
-                        zip_ref.extractall(temp_dir)
-                    zip_file.unlink()  # Delete zip after extraction
-                except zipfile.BadZipFile:
-                    raise Exception(f"Downloaded file is not a valid zip: {zip_file.name}")
-            
-            if progress_callback:
-                progress_callback(70, "Loading dataset...")
-            
-            # Find CSV file
-            csv_files = list(temp_dir.glob("*.csv"))
-            if not csv_files:
-                # Try nested directories
-                csv_files = list(temp_dir.rglob("*.csv"))
-            
-            if not csv_files:
-                # List what files we have
-                all_extracted = list(temp_dir.rglob("*"))
-                file_types = set([f.suffix for f in all_extracted if f.is_file()])
-                raise Exception(f"No CSV files found. Available file types: {file_types}")
-            
-            # Load first CSV (main dataset)
-            csv_file = csv_files[0]
-            data = pd.read_csv(csv_file, nrows=10000)  # Limit rows for memory
-            
-            if progress_callback:
-                progress_callback(90, "Caching dataset...")
-            
-            # Copy to cache
-            cache_path.mkdir(parents=True, exist_ok=True)
-            cache_file = cache_path / csv_file.name
-            data.to_csv(cache_file, index=False)
-            
-            # Cleanup temp directory
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            
-            if progress_callback:
-                progress_callback(100, f"Kaggle dataset loaded: {len(data)} rows")
-            
-            return data
-            
-        except Exception as e:
-            print(f"Error ingesting Kaggle dataset: {e}")
-            return None
-    
-    def _ingest_remote_url(self, url: str, cache_path: Path, progress_callback=None) -> Optional[pd.DataFrame]:
-        """Ingest data from remote URL."""
-        try:
-            cache_path.mkdir(parents=True, exist_ok=True)
-            
-            # Check if Mendeley URL
-            if "mendeley.com/datasets" in url:
-                raise Exception(
-                    "Mendeley datasets require manual download. Please:\n"
-                    "1. Visit: " + url + "\n"
-                    "2. Click the download button on their website\n"
-                    "3. Upload the file using the 'Upload Local File' option instead"
-                )
-            
-            # Determine file type from URL
-            parsed = urlparse(url)
-            filename = os.path.basename(parsed.path) or "data.csv"
-            
-            # If no extension, try to get it from the response
-            if '.' not in filename:
-                filename = "data.csv"  # default
-            
-            filepath = cache_path / filename
-            
-            if progress_callback:
-                progress_callback(20, "Attempting download...")
-            
-            # Try to download
-            response = requests.head(url, timeout=10, allow_redirects=True)
-            content_type = response.headers.get('content-type', '').lower()
-            
-            # Check if it's actually a file (not HTML page)
-            if 'text/html' in content_type:
-                # This is a web page, not a downloadable file
-                if progress_callback:
-                    progress_callback(50, "Searching for downloadable data...")
-                
-                # Try GET to look for download links in HTML
-                response = requests.get(url, timeout=30)
-                if response.status_code == 200:
-                    # Check if there are any data files mentioned
-                    if '.csv' in response.text.lower() or '.xlsx' in response.text.lower():
-                        raise Exception(f"This is a dataset page (not a direct file). Please download the file manually and provide the direct link or file path.")
-                    else:
-                        raise Exception(f"Invalid URL: No data file found at this location")
-                else:
-                    raise Exception(f"Failed to access URL: HTTP {response.status_code}")
-            
-            # Download the actual file
-            if not self._download_file(url, filepath, progress_callback):
-                raise Exception("Download failed - check URL and internet connection")
-            
-            if progress_callback:
-                progress_callback(80, "Loading data...")
-            
-            # Load data based on file type
-            if filename.endswith('.csv'):
-                return pd.read_csv(filepath)
-            elif filename.endswith('.parquet'):
-                return pd.read_parquet(filepath)
-            elif filename.endswith('.json'):
-                return pd.read_json(filepath)
-            elif filename.endswith('.xlsx') or filename.endswith('.xls'):
-                return pd.read_excel(filepath)
-            else:
-                # Try to detect by trying to load as different formats
-                try:
-                    return pd.read_csv(filepath)
-                except:
-                    try:
-                        return pd.read_parquet(filepath)
-                    except:
-                        try:
-                            return pd.read_json(filepath)
-                        except:
-                            raise Exception(f"Unsupported file format: {filename}")
-        except Exception as e:
-            if progress_callback:
-                progress_callback(100, f"Load failed: {str(e)[:50]}")
-            print(f"Error ingesting remote URL: {e}")
-            return None
-    
-    def _ingest_local_path(self, path: str, cache_path: Path, progress_callback=None) -> Optional[pd.DataFrame]:
-        """Ingest data from local path."""
-        try:
-            if progress_callback:
-                progress_callback(30, f"Loading local file...")
-            
-            if path.endswith('.csv'):
-                data = pd.read_csv(path)
-            elif path.endswith('.parquet'):
-                data = pd.read_parquet(path)
-            elif path.endswith('.json'):
-                data = pd.read_json(path)
-            else:
-                return None
-            
-            if progress_callback:
-                progress_callback(100, "Local data loaded")
-            
-            return data
-        except Exception as e:
-            print(f"Error ingesting local path: {e}")
-            return None
-    
-    def _save_to_cache(self, cache_path: Path, source_hash: str, data: pd.DataFrame, source: str):
-        """Save data and metadata to cache."""
+                metadata["cache_status"][source] = "ok"
+
+        return lazy_datasets, metadata
+
+    # ------------------------------------------------------------------ #
+    # Per-source dispatch
+    # ------------------------------------------------------------------ #
+
+    async def _ingest_single(
+        self,
+        source: str,
+        force_download: bool,
+    ) -> Optional[Tuple[Any, Path]]:
+        """
+        Ingest one source.  Returns (lazy_ref, cache_path) or raises.
+        Exceptions propagate to asyncio.gather for per-URL isolation.
+
+        Backward compatibility: if the normalised hash produces a cache miss,
+        falls back to the legacy (raw-string) hash.  If found under the legacy
+        key the metadata is migrated to the new normalised key in-place.
+        """
+        source_hash = self._generate_hash(source)
+        cache_path = self.cache_dir / source_hash
+
+        # Reload metadata from disk in case another process updated the cache
+        self.cache_metadata = self._load_cache_metadata()
+
+        # Cache hit: try normalised hash first, then legacy raw-string hash
+        if not force_download:
+            # Try normalised hash
+            if source_hash in self.cache_metadata:
+                lazy_ref = self._loader.load_cached(cache_path)
+                if lazy_ref is not None:
+                    logger.info("Cache HIT  [%s] -> %s", source_hash, source)
+                    return lazy_ref, cache_path
+
+            # Try legacy hash (raw string, pre-normalisation era)
+            legacy_hash = self._legacy_hash(source)
+            if legacy_hash != source_hash and legacy_hash in self.cache_metadata:
+                legacy_path = self.cache_dir / legacy_hash
+                lazy_ref = self._loader.load_cached(legacy_path)
+                if lazy_ref is not None:
+                    logger.info(
+                        "Cache HIT  [%s] (legacy hash for %s) — migrating to [%s]",
+                        legacy_hash, source, source_hash,
+                    )
+                    # Migrate metadata to normalised key
+                    self.cache_metadata[source_hash] = self.cache_metadata.pop(legacy_hash)
+                    self.cache_metadata[source_hash]["source_hash"] = source_hash
+                    self._save_cache_metadata()
+                    # Rename directory so future lookups use the normalised hash
+                    if legacy_path.exists() and not cache_path.exists():
+                        legacy_path.rename(cache_path)
+                    return lazy_ref, cache_path if cache_path.exists() else legacy_path
+
+        logger.info("Cache MISS [%s] -> downloading %s", source_hash, source)
+
+        # Route to the right downloader
+        if self._is_kaggle_url(source):
+            cache_path = await self._ingest_kaggle(source, cache_path)
+        elif source.startswith(("http://", "https://")):
+            cache_path = await self._ingest_remote_url(source, cache_path)
+        else:
+            cache_path = await self._ingest_local_path(source, cache_path)
+
+        # DVC lineage tracking (offloaded to thread – subprocess.run is blocking)
+        await asyncio.to_thread(self._dvc_add, cache_path)
+
+        # Persist cache metadata (offloaded – json.dump is blocking I/O)
+        await asyncio.to_thread(
+            self._update_cache_metadata, source_hash, source, cache_path
+        )
+
+        lazy_ref = self._loader.load_cached(cache_path)
+        if lazy_ref is None:
+            raise RuntimeError(
+                f"Cache directory {cache_path} has no recognised data files "
+                "after ingestion."
+            )
+        return lazy_ref, cache_path
+
+    # ------------------------------------------------------------------ #
+    # Remote URL downloader (aiohttp – truly async)
+    # ------------------------------------------------------------------ #
+
+    async def _ingest_remote_url(self, url: str, cache_path: Path) -> Path:
+        """
+        Download a remote URL with aiohttp.
+        Raises FileNotFoundError on 404; ConnectionError on other HTTP errors.
+        """
+        if "mendeley.com/datasets" in url:
+            raise ValueError(
+                "Mendeley datasets must be downloaded manually. "
+                "Use the local-file upload option instead."
+            )
+
+        parsed = urlparse(url)
+        filename = os.path.basename(parsed.path) or "data.csv"
+        if "." not in filename:
+            filename = "data.csv"
+
         cache_path.mkdir(parents=True, exist_ok=True)
+        filepath = cache_path / filename
+
+        # total=7200 (2 h) accommodates 50 GB+ downloads on slower links;
+        # sock_read=300 still aborts genuinely stalled connections quickly.
+        timeout = aiohttp.ClientTimeout(total=7200, sock_read=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                if response.status == 404:
+                    raise FileNotFoundError(f"HTTP 404 Not Found: {url}")
+                if response.status != 200:
+                    raise ConnectionError(
+                        f"HTTP {response.status} while downloading {url}"
+                    )
+                content_type = response.headers.get("Content-Type", "")
+                if "text/html" in content_type:
+                    raise ValueError(
+                        f"URL returns an HTML page, not a direct data file: {url}"
+                    )
+                # Write chunks via asyncio.to_thread so synchronous disk I/O
+                # never blocks the event loop (critical for 50 GB+ files).
+                fh = await asyncio.to_thread(open, filepath, "wb")
+                try:
+                    async for chunk in response.content.iter_chunked(65536):
+                        await asyncio.to_thread(fh.write, chunk)
+                finally:
+                    await asyncio.to_thread(fh.close)
+
+        logger.info("Downloaded %s -> %s", url, filepath)
+        return cache_path
+
+    # ------------------------------------------------------------------ #
+    # Kaggle downloader (sync, run in thread-pool executor)
+    # ------------------------------------------------------------------ #
+
+    async def _ingest_kaggle(self, url: str, cache_path: Path) -> Path:
+        """Offload blocking Kaggle CLI call to a thread-pool executor."""
+        return await asyncio.to_thread(
+            self._ingest_kaggle_sync, url, cache_path
+        )
+
+    def _ingest_kaggle_sync(self, url: str, cache_path: Path) -> Path:
+        """
+        Synchronous Kaggle ingestion.
+        Credentials are read from environment variables first, then from ~/.kaggle/kaggle.json as fallback.
+        """
+        kaggle_username: Optional[str] = os.getenv("KAGGLE_USERNAME")
+        kaggle_key: Optional[str] = os.getenv("KAGGLE_KEY")
         
-        # Save data
-        data_file = cache_path / "data.parquet"
-        data.to_parquet(data_file)
+        # Fallback: read from ~/.kaggle/kaggle.json if env vars not set
+        if not kaggle_username or not kaggle_key:
+            kaggle_json_path = Path.home() / ".kaggle" / "kaggle.json"
+            if kaggle_json_path.exists():
+                try:
+                    with open(kaggle_json_path, "r") as f:
+                        creds = json.load(f)
+                        kaggle_username = creds.get("username")
+                        kaggle_key = creds.get("key")
+                        logger.info("Loaded Kaggle credentials from ~/.kaggle/kaggle.json")
+                except Exception as e:
+                    logger.warning("Failed to read kaggle.json: %s", e)
         
-        # Save metadata
-        cache_meta = {
+        if not kaggle_username or not kaggle_key:
+            raise EnvironmentError(
+                "Kaggle credentials missing. "
+                "Set KAGGLE_USERNAME and KAGGLE_KEY environment variables or ensure ~/.kaggle/kaggle.json exists."
+            )
+
+        parts = url.strip("/").split("/")
+        if len(parts) < 2:
+            raise ValueError(f"Invalid Kaggle URL format: {url}")
+        dataset_id = f"{parts[-2]}/{parts[-1]}"
+
+        temp_dir = Path(tempfile.gettempdir()) / f"kaggle_{parts[-1]}"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            env = {
+                **os.environ,
+                "KAGGLE_USERNAME": kaggle_username,
+                "KAGGLE_KEY": kaggle_key,
+            }
+            result = subprocess.run(
+                [
+                    "kaggle", "datasets", "download",
+                    "-d", dataset_id,
+                    "-p", str(temp_dir),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=1800,
+                env=env,
+            )
+            if result.returncode != 0:
+                if "401" in result.stderr or "Unauthorized" in result.stderr:
+                    raise PermissionError(
+                        "Kaggle API authentication failed. Check credentials."
+                    )
+                raise RuntimeError(f"kaggle CLI failed: {result.stderr}")
+
+            zip_files = list(temp_dir.glob("*.zip"))
+            if not zip_files:
+                raise RuntimeError(
+                    f"Expected a zip from Kaggle for {dataset_id}, got none."
+                )
+            for zf in zip_files:
+                with zipfile.ZipFile(zf, "r") as zref:
+                    zref.extractall(temp_dir)
+                zf.unlink()
+
+            csv_files = list(temp_dir.rglob("*.csv"))
+            if not csv_files:
+                raise RuntimeError(
+                    f"No CSV found in Kaggle archive for {dataset_id}."
+                )
+
+            cache_path.mkdir(parents=True, exist_ok=True)
+            dest = cache_path / csv_files[0].name
+            shutil.copy2(csv_files[0], dest)
+
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        logger.info("Kaggle dataset %s cached at %s", dataset_id, cache_path)
+        return cache_path
+
+    # ------------------------------------------------------------------ #
+    # Local path (run in executor to avoid blocking the event loop)
+    # ------------------------------------------------------------------ #
+
+    async def _ingest_local_path(self, path: str, cache_path: Path) -> Path:
+        return await asyncio.to_thread(
+            self._copy_local_path, path, cache_path
+        )
+
+    def _copy_local_path(self, path: str, cache_path: Path) -> Path:
+        src = Path(path)
+        if not src.exists():
+            raise FileNotFoundError(f"Local file not found: {path}")
+        cache_path.mkdir(parents=True, exist_ok=True)
+        dest = cache_path / src.name
+        shutil.copy2(src, dest)
+        logger.info("Local file copied %s -> %s", src, dest)
+        return cache_path
+
+    # ------------------------------------------------------------------ #
+    # Cache metadata persistence
+    # ------------------------------------------------------------------ #
+
+    def _update_cache_metadata(
+        self,
+        source_hash: str,
+        source: str,
+        cache_path: Path,
+    ) -> None:
+        meta: Dict[str, Any] = {
             "source": source,
             "source_hash": source_hash,
             "timestamp": datetime.now().isoformat(),
-            "shape": data.shape,
-            "columns": list(data.columns),
-            "dtypes": {col: str(dtype) for col, dtype in data.dtypes.items()},
-            "size_mb": os.path.getsize(data_file) / (1024 * 1024),
+            "cache_path": str(cache_path),
         }
-        
-        meta_file = cache_path / "metadata.json"
-        with open(meta_file, 'w') as f:
-            json.dump(cache_meta, f, indent=2)
-        
-        # Update global cache metadata
-        self.cache_metadata[source_hash] = cache_meta
+        data_files = list(cache_path.glob("*.parquet")) + list(cache_path.glob("*.csv"))
+        if data_files:
+            meta["size_mb"] = round(os.path.getsize(data_files[0]) / (1024 * 1024), 3)
+        self.cache_metadata[source_hash] = meta
         self._save_cache_metadata()
-    
-    def _load_cached_data(self, cache_path: Path, source_hash: str) -> Optional[pd.DataFrame]:
-        """Load data from cache."""
-        try:
-            data_file = cache_path / "data.parquet"
-            if data_file.exists():
-                return pd.read_parquet(data_file)
-        except Exception as e:
-            print(f"Error loading cached data: {e}")
-        return None
-    
-    def get_cache_info(self) -> Dict:
-        """Get information about cached datasets."""
+
+    # ------------------------------------------------------------------ #
+    # Utility
+    # ------------------------------------------------------------------ #
+
+    def get_cache_info(self) -> Dict[str, Any]:
         return {
             "total_cached": len(self.cache_metadata),
             "cache_dir": str(self.cache_dir),
             "cached_items": list(self.cache_metadata.keys()),
-            "metadata": self.cache_metadata
+            "metadata": self.cache_metadata,
         }
-    
-    def clear_cache(self, source_hash: Optional[str] = None):
-        """Clear cache directory."""
+
+    def clear_cache(self, source_hash: Optional[str] = None) -> None:
         if source_hash:
             cache_path = self.cache_dir / source_hash
             if cache_path.exists():
-                import shutil
                 shutil.rmtree(cache_path)
-                if source_hash in self.cache_metadata:
-                    del self.cache_metadata[source_hash]
-                self._save_cache_metadata()
+            self.cache_metadata.pop(source_hash, None)
+            self._save_cache_metadata()
         else:
-            import shutil
             shutil.rmtree(self.cache_dir, ignore_errors=True)
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             self.cache_metadata = {}

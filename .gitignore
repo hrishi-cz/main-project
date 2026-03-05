@@ -40,3 +40,7 @@ Thumbs.db
 # Cache
 .cache/
 .pytest_cache/
+
+# Temp files
+tmpclaude-*/
+nul

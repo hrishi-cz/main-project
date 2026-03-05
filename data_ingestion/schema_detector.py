@@ -1,469 +1,639 @@
-"""Advanced schema detection with column type and problem type inference."""
+"""
+AutoVision+ Tier-2 Multi-Dataset Schema Engine — UNIVERSAL VERSION
 
-import pandas as pd
+Two-tier detection architecture:
+
+  Tier 1  _detect_single(dataset_id, lazy_data)
+          Accepts any of: Polars LazyFrame, Dask DataFrame, pandas DataFrame,
+          or a PyTorch Dataset.  Materialises at most 500 rows into a pandas
+          sample; never loads the whole dataset.  Computes per-column
+          heuristics and returns an IndividualSchema.
+
+  Tier 2  detect_global_schema(datasets)
+          Loops over every lazy reference, calls Tier 1, then aggregates the
+          results into a single GlobalSchema (global problem type, union of
+          modalities, primary target).
+
+Supported modalities:   tabular | text | image | timeseries
+Supported problem types: classification_binary | classification_multiclass
+                         | regression | multilabel_classification | unsupervised
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import asdict
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-import json
-import re
-from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
+import pandas as pd
+
+from data_ingestion.schema import GlobalSchema, IndividualSchema
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Backward-compat alias so any code still importing SingleDatasetSchema works
+# ---------------------------------------------------------------------------
+SingleDatasetSchema = IndividualSchema
 
 
-# Constants
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp', '.svg'}
-TIMESERIES_EXTENSIONS = {'.npy', '.wav', '.csv', '.parquet', '.h5', '.hdf5', '.mat'}
-TARGET_KEYWORDS = {'target', 'label', 'diagnosis', 'class', 'category', 'outcome', 'result', 'scp_codes', 'diagnostic'}
-
-def is_json_like(value: str) -> bool:
-    """Check if string is JSON/dict-like."""
-    try:
-        json.loads(value)
-        return True
-    except (json.JSONDecodeError, TypeError):
-        return False
-
-
-def is_multi_label(col_data: pd.Series) -> bool:
-    """Check if column contains multi-label values (lists, dicts, comma/pipe separated)."""
-    sample = col_data.dropna().head(50).astype(str)
-    if len(sample) == 0:
-        return False
-    
-    multi_label_indicators = 0
-    for val in sample:
-        val_str = str(val).strip()
-        # Check for JSON/dict format: {"key": "value"}
-        if val_str.startswith('{') or val_str.startswith('['):
-            multi_label_indicators += 1
-        # Check for comma/pipe separated with multiple items
-        elif ',' in val_str or '|' in val_str:
-            parts = re.split(r'[,|]', val_str)
-            if len(parts) > 1 and any(p.strip() for p in parts):
-                multi_label_indicators += 1
-    
-    return (multi_label_indicators / len(sample)) > 0.3
-
-
-def simple_similarity(s1: str, s2: str) -> float:
-    """Simple string similarity ratio (0-100) using basic matching."""
-    s1 = s1.lower()
-    s2 = s2.lower()
-    
-    # Exact match
-    if s1 == s2:
-        return 100
-    
-    # Substring match
-    if s1 in s2 or s2 in s1:
-        return 85
-    
-    # Character overlap ratio
-    s1_set = set(s1)
-    s2_set = set(s2)
-    overlap = len(s1_set & s2_set)
-    union = len(s1_set | s2_set)
-    
-    if union == 0:
-        return 0
-    
-    return (overlap / union) * 100
-
-
-@dataclass
-class DetectedColumn:
-    """Detected column information."""
-    name: str
-    modality: str  # 'image', 'text', 'tabular', 'timeseries', 'multi-label'
-    dtype: str
-    cardinality: int
-    sample_values: List
-
-
-@dataclass
-class SchemaDetectionResult:
-    """Result of schema detection."""
-    image_cols: List[str]
-    text_cols: List[str]
-    tabular_cols: List[str]
-    target_col: Optional[str]
-    problem_type: str  # 'classification_binary', 'classification_multiclass', 'regression'
-    detected_columns: List[Dict]
-    detection_confidence: float
-    modalities: List[str]
-
-
-class SchemaDetector:
-    """Automatically detect schema and problem type from data."""
-    
-    # Image file extensions
-    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.tiff'}
-    
-    # Target column fuzzy match keywords
-    TARGET_KEYWORDS = ['label', 'target', 'class', 'y', 'outcome', 'result', 'prediction']
-    
-    def __init__(self, text_length_threshold: int = 50, fuzzy_threshold: int = 75):
-        self.text_length_threshold = text_length_threshold
-        self.fuzzy_threshold = fuzzy_threshold
-    
-    def detect_schema(
-        self,
-        data: pd.DataFrame,
-        progress_callback=None
-    ) -> SchemaDetectionResult:
-        """
-        Automatically detect schema from data.
-        
-        Args:
-            data: Input DataFrame
-            progress_callback: Progress callback function
-        
-        Returns:
-            SchemaDetectionResult with detected columns and problem type
-        """
-        if progress_callback:
-            progress_callback(10, "Starting schema detection...")
-        
-        # Phase 1: Detect column types
-        if progress_callback:
-            progress_callback(20, "Detecting column types...")
-        
-        detected_columns = []
-        image_cols = []
-        text_cols = []
-        tabular_cols = []
-        timeseries_cols = []
-        multi_label_cols = []
-        for col in data.columns:
-            detected = self._detect_column_type(col, data[col])
-            detected_columns.append(detected)
-            if detected.modality == 'image':
-                image_cols.append(col)
-            elif detected.modality == 'text':
-                text_cols.append(col)
-            elif detected.modality == 'tabular':
-                tabular_cols.append(col)
-            elif detected.modality == 'timeseries':
-                timeseries_cols.append(col)
-            elif detected.modality == 'multi-label':
-                multi_label_cols.append(col)
-        if progress_callback:
-            progress_callback(40, f"Detected {len(image_cols)} image, {len(text_cols)} text, {len(tabular_cols)} tabular, {len(timeseries_cols)} timeseries, {len(multi_label_cols)} multi-label columns")
-        
-        # Phase 2: Detect target column
-        if progress_callback:
-            progress_callback(50, "Detecting target column...")
-        
-        target_col = self._detect_target_column(data, tabular_cols, image_cols, text_cols, timeseries_cols, multi_label_cols)
-        
-        if progress_callback:
-            progress_callback(60, f"Target column: {target_col or 'Not found'}")
-        
-        # Phase 3: Infer problem type
-        if progress_callback:
-            progress_callback(70, "Inferring problem type...")
-        
-        problem_type = "unsupervised"
-        if target_col is not None:
-            problem_type = self._infer_problem_type(data[target_col])
-        
-        if progress_callback:
-            progress_callback(90, f"Problem type: {problem_type}")
-        
-        # Phase 4: Calculate confidence
-        modalities = list(set([col.modality for col in detected_columns]))
-        confidence = self._calculate_confidence(data, target_col, modalities)
-        
-        if progress_callback:
-            progress_callback(100, f"Detection complete (confidence: {confidence:.2%})")
-        
-        return SchemaDetectionResult(
-            image_cols=image_cols,
-            text_cols=text_cols,
-            tabular_cols=tabular_cols,
-            target_col=target_col,
-            problem_type=problem_type,
-            detected_columns=[asdict(col) for col in detected_columns],
-            detection_confidence=confidence,
-            modalities=modalities
-        )
-    
-    def _detect_column_type(self, col_name: str, col_data: pd.Series) -> DetectedColumn:
-        """Detect column modality (image, text, tabular, timeseries, multi-label)."""
-        non_null = col_data.dropna()
-        if len(non_null) == 0:
-            return DetectedColumn(
-                name=col_name,
-                modality='tabular',
-                dtype='unknown',
-                cardinality=0,
-                sample_values=[]
-            )
-
-        # Image detection: file paths with image extensions
-        if col_data.dtype == 'object':
-            sample = non_null.head(20).astype(str)
-            image_count = sum(1 for val in sample if any(val.lower().endswith(ext) for ext in IMAGE_EXTENSIONS))
-            if image_count / len(sample) > 0.5:
-                return DetectedColumn(
-                    name=col_name,
-                    modality='image',
-                    dtype='str',
-                    cardinality=len(non_null.unique()),
-                    sample_values=non_null.head(3).tolist()
-                )
-
-        # Timeseries detection: arrays, lists, signal file references
-        if col_data.dtype == 'object':
-            sample = non_null.head(20).astype(str)
-            ts_count = sum(1 for val in sample if val.startswith('[') or val.startswith('{') or any(val.lower().endswith(ext) for ext in TIMESERIES_EXTENSIONS))
-            if ts_count / len(sample) > 0.3:
-                return DetectedColumn(
-                    name=col_name,
-                    modality='timeseries',
-                    dtype='object',
-                    cardinality=len(non_null.unique()),
-                    sample_values=non_null.head(3).tolist()
-                )
-
-        # Multi-label detection: lists, dicts, comma/pipe separated
-        if is_multi_label(non_null):
-            return DetectedColumn(
-                name=col_name,
-                modality='multi-label',
-                dtype='object',
-                cardinality=len(non_null.unique()),
-                sample_values=non_null.head(3).tolist()
-            )
-
-        # Text detection: long strings
-        if col_data.dtype == 'object':
-            sample = non_null.head(50).astype(str)
-            avg_length = sample.str.len().mean()
-            is_long_text = avg_length > self.text_length_threshold
-            is_mostly_strings = sample.str.len().std() > 10
-            if is_long_text and is_mostly_strings:
-                return DetectedColumn(
-                    name=col_name,
-                    modality='text',
-                    dtype='str',
-                    cardinality=len(non_null.unique()),
-                    sample_values=non_null.head(3).tolist()
-                )
-
-        # Default: tabular (numeric or categorical)
-        return DetectedColumn(
-            name=col_name,
-            modality='tabular',
-            dtype=str(col_data.dtype),
-            cardinality=len(non_null.unique()),
-            sample_values=non_null.head(3).tolist()
-        )
-    
-    def _is_image_column(self, col_data: pd.Series) -> bool:
-        """Check if column contains image paths."""
-        if col_data.dtype != 'object':
-            return False
-        
-        # Check sample values for image extensions
-        sample = col_data.head(20).astype(str)
-        image_count = sum(1 for val in sample if any(val.lower().endswith(ext) for ext in self.IMAGE_EXTENSIONS))
-        
-        return image_count / len(sample) > 0.5
-    
-    def _is_text_column(self, col_data: pd.Series) -> bool:
-        """Check if column contains text data."""
-        if col_data.dtype != 'object':
-            return False
-        
-        # Get non-null values for checking
-        non_null = col_data.dropna()
-        if len(non_null) == 0:
-            return False
-        
-        # Check average string length of actual values
-        sample = non_null.head(50).astype(str)
-        avg_length = sample.str.len().mean()
-        
-        # Must have average length > threshold AND be mostly strings (not short categories)
-        is_long_text = avg_length > self.text_length_threshold
-        is_mostly_strings = sample.str.len().std() > 10  # Varied length indicates text
-        
-        return is_long_text and is_mostly_strings
-    
-    def _detect_target_column(
-        self,
-        data: pd.DataFrame,
-        tabular_cols: List[str],
-        image_cols: List[str],
-        text_cols: List[str],
-        timeseries_cols: List[str],
-        multi_label_cols: List[str]
-    ) -> Optional[str]:
-        """Detect target column using fuzzy name, cardinality, multi-label, and heuristics."""
-        candidates = multi_label_cols + tabular_cols + timeseries_cols + text_cols + image_cols
-        if not candidates:
-            return None
-        best_match = None
-        best_score = 0
-        for col in candidates:
-            col_name_lower = col.lower()
-            keyword_score = max((simple_similarity(col_name_lower, keyword), keyword) for keyword in TARGET_KEYWORDS)
-            keyword_score = keyword_score[0] if keyword_score else 0
-            unique_count = len(data[col].unique())
-            cardinality_ratio = unique_count / len(data)
-            # Multi-label bonus
-            multi_label_bonus = 20 if is_multi_label(data[col]) else 0
-            # Cardinality scoring
-            if cardinality_ratio < 0.05:
-                cardinality_score = 0.3
-            elif cardinality_ratio < 0.5:
-                cardinality_score = 1.0
-            elif cardinality_ratio < 0.8:
-                cardinality_score = 0.7
-            else:
-                cardinality_score = 0.2
-            is_categorical = not pd.api.types.is_numeric_dtype(data[col])
-            categorical_score = 0.8 if is_categorical else 0.3
-            combined_score = (keyword_score * 0.3) + (cardinality_score * 0.3) + (categorical_score * 0.2) + multi_label_bonus
-            if combined_score > best_score:
-                best_score = combined_score
-                best_match = col
-        if best_score < 40 and candidates:
-            best_match = candidates[-1]
-        return best_match
-    
-    def _infer_problem_type(self, target_col: pd.Series) -> str:
-        """Infer problem type: binary, multi-class, multi-label, regression, timeseries."""
-        unique_values = target_col.nunique()
-        if is_multi_label(target_col):
-            return "classification_multilabel"
-        if pd.api.types.is_numeric_dtype(target_col):
-            if unique_values <= 20:
-                if unique_values == 2:
-                    return "classification_binary"
-                else:
-                    return "classification_multiclass"
-            else:
-                return "regression"
-        else:
-            if unique_values == 2:
-                return "classification_binary"
-            elif unique_values <= 20:
-                return "classification_multiclass"
-            else:
-                return "classification_multilabel"
-    
-    def _calculate_confidence(
-        self,
-        data: pd.DataFrame,
-        target_col: Optional[str],
-        modalities: List[str]
-    ) -> float:
-        """Calculate overall detection confidence."""
-        confidence = 0.6  # Base confidence (higher for real data)
-        
-        # Sufficient columns indicate real data
-        if len(data.columns) >= 3:
-            confidence += 0.15
-        
-        # Sufficient samples indicate real data
-        if len(data) >= 50:
-            confidence += 0.15
-        
-        # Target found = higher confidence
-        if target_col is not None:
-            confidence += 0.1
-        
-        return min(confidence, 1.0)
-
+# ===========================================================================
+# Main Engine
+# ===========================================================================
 
 class MultiDatasetSchemaDetector:
-    """Detect and merge schemas from multiple datasets."""
-    
-    def __init__(self):
-        self.detector = SchemaDetector()
-    
-    def detect_schema(
+    """
+    Universal schema detector.
+
+    Public API
+    ----------
+    detect_global_schema(datasets)  – primary entry-point (lazy-aware)
+    detect_schema(datasets)         – legacy API (accepts pandas DataFrames,
+                                      returns dict for backward compatibility)
+    """
+
+    TARGET_KEYWORDS: List[str] = [
+        "target", "label", "class", "y",
+        "diagnosis", "condition", "output",
+        "result", "severity",
+    ]
+
+    IMAGE_EXTENSIONS: Tuple[str, ...] = (
+        ".png", ".jpg", ".jpeg", ".bmp", ".tiff",
+    )
+
+    # -----------------------------------------------------------------------
+    # Tier-2: collective inference (PRIMARY PUBLIC METHOD)
+    # -----------------------------------------------------------------------
+
+    def detect_global_schema(
         self,
-        datasets: Dict[str, pd.DataFrame],
-        progress_callback=None
-    ) -> Dict:
+        datasets: Dict[str, Any],
+    ) -> GlobalSchema:
         """
-        Detect schemas from multiple datasets.
-        
+        Tier-2 collective inference across all datasets in the current session.
+
         Args:
-            datasets: Dictionary of {dataset_hash: DataFrame}
-            progress_callback: Progress callback
-        
+            datasets: Mapping of dataset_id -> lazy reference.
+                      Accepted types: polars.LazyFrame, dask.dataframe.DataFrame,
+                      pandas.DataFrame (legacy), or torch.utils.data.Dataset.
+
         Returns:
-            Combined schema information
+            GlobalSchema with resolved problem type, union of modalities,
+            primary target, and serialised per-dataset breakdowns.
         """
-        # Use the existing detect_and_merge_schemas method
-        merged_result = self.detect_and_merge_schemas(datasets, progress_callback)
-        
-        # Extract key information for API response
-        detected_schemas = merged_result.get("detected_schemas", {})
-        merged_info = merged_result.get("merged", {})
-        
-        # Get first schema's details for summary
-        first_schema = next(iter(detected_schemas.values())) if detected_schemas else None
-        
-        return {
-            "status": "success",
-            "datasets_analyzed": len(datasets),
-            "target_column": first_schema.target_col if first_schema else None,
-            "problem_type": first_schema.problem_type if first_schema else "unsupervised",
-            "modalities": merged_info.get("modalities", []),
-            "detection_confidence": first_schema.detection_confidence if first_schema else 0.0,
-            "detected_schemas": {
-                hash_id: asdict(schema) 
-                for hash_id, schema in detected_schemas.items()
-            }
-        }
-    
-    def detect_and_merge_schemas(
+        per_dataset_results: List[Dict[str, Any]] = []
+
+        for dataset_id, lazy_data in datasets.items():
+            try:
+                schema: IndividualSchema = self._detect_single(
+                    dataset_id, lazy_data
+                )
+                per_dataset_results.append(asdict(schema))
+                logger.info(
+                    "Schema Tier-1 [%s]: modalities=%s  target=%s  problem=%s  conf=%.2f",
+                    dataset_id,
+                    schema.modalities,
+                    schema.target_column,
+                    schema.problem_type,
+                    schema.confidence,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Schema Tier-1 failed for [%s]: %s", dataset_id, exc
+                )
+                # Produce a safe fallback so the pipeline never hard-crashes
+                per_dataset_results.append(
+                    asdict(
+                        IndividualSchema(
+                            dataset_id=dataset_id,
+                            detected_columns={
+                                "image": [], "text": [], "tabular": [], "timeseries": []
+                            },
+                            target_column="Unknown",
+                            problem_type="unsupervised",
+                            modalities=["tabular"],
+                            confidence=0.0,
+                        )
+                    )
+                )
+
+        global_modalities: List[str] = self._aggregate_modalities(per_dataset_results)
+        global_problem: str = self._aggregate_problem_type(per_dataset_results)
+        primary_target: str = self._select_primary_target(per_dataset_results)
+        fusion_ready: bool = len(global_modalities) > 1
+
+        # Cross-dataset relatedness checking
+        groups, relatedness_report = self._check_relatedness(per_dataset_results)
+        if len(groups) > 1:
+            logger.warning(
+                "Schema Tier-2: detected %d unrelated dataset groups: %s",
+                len(groups), groups,
+            )
+            # Re-aggregate using only the largest related group
+            largest_group = max(groups, key=len)
+            filtered = [per_dataset_results[i] for i in largest_group]
+            global_modalities = self._aggregate_modalities(filtered)
+            global_problem = self._aggregate_problem_type(filtered)
+            primary_target = self._select_primary_target(filtered)
+            fusion_ready = len(global_modalities) > 1
+            logger.info(
+                "Schema Tier-2: using largest related group (indices %s) "
+                "for global schema",
+                largest_group,
+            )
+
+        confidence: float = (
+            float(np.mean([d["confidence"] for d in per_dataset_results]))
+            if per_dataset_results
+            else 0.0
+        )
+
+        logger.info(
+            "Schema Tier-2 global: modalities=%s  problem=%s  target=%s  fusion=%s",
+            global_modalities,
+            global_problem,
+            primary_target,
+            fusion_ready,
+        )
+
+        return GlobalSchema(
+            global_problem_type=global_problem,
+            global_modalities=global_modalities,
+            primary_target=primary_target,
+            fusion_ready=fusion_ready,
+            detection_confidence=round(confidence, 3),
+            per_dataset=per_dataset_results,
+            relatedness_report=relatedness_report,
+        )
+
+    # -----------------------------------------------------------------------
+    # Legacy wrapper – accepts Dict[str, pd.DataFrame], returns plain dict
+    # -----------------------------------------------------------------------
+
+    def detect_schema(self, datasets: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+        """
+        Backward-compatible entry-point.  Accepts pandas DataFrames and
+        returns the asdict() serialisation of the GlobalSchema.
+
+        Delegates to detect_global_schema, which handles pandas DataFrames
+        through _materialise_sample's pandas branch.
+        """
+        global_schema: GlobalSchema = self.detect_global_schema(datasets)
+        return asdict(global_schema)
+
+    # -----------------------------------------------------------------------
+    # Tier-1: single-dataset inspector
+    # -----------------------------------------------------------------------
+
+    def _detect_single(
         self,
-        datasets: Dict[str, pd.DataFrame],
-        progress_callback=None
-    ) -> Dict:
+        dataset_id: str,
+        lazy_data: Any,
+    ) -> IndividualSchema:
         """
-        Detect schemas from multiple datasets and merge them.
-        
-        Args:
-            datasets: Dictionary of {dataset_hash: DataFrame}
-            progress_callback: Progress callback
-        
-        Returns:
-            Merged schema information
+        Tier-1: inspect one lazy dataset.
+
+        Materialises at most 500 rows for heuristic computation.  For PyTorch
+        Datasets (image-only) it returns an image-modality schema directly
+        without any column analysis.
         """
-        detected_schemas = {}
-        all_modalities = set()
-        all_image_cols = set()
-        all_text_cols = set()
-        all_tabular_cols = set()
-        
-        for i, (hash_id, data) in enumerate(datasets.items()):
-            if progress_callback:
-                progress = (i / len(datasets)) * 100
-                progress_callback(progress, f"Detecting schema for dataset {i+1}/{len(datasets)}")
-            
-            schema = self.detector.detect_schema(data)
-            detected_schemas[hash_id] = schema
-            
-            all_modalities.update(schema.modalities)
-            all_image_cols.update(schema.image_cols)
-            all_text_cols.update(schema.text_cols)
-            all_tabular_cols.update(schema.tabular_cols)
-        
-        if progress_callback:
-            progress_callback(100, "Schema detection complete")
-        
-        return {
-            "detected_schemas": detected_schemas,
-            "merged": {
-                "modalities": list(all_modalities),
-                "image_cols_count": len(all_image_cols),
-                "text_cols_count": len(all_text_cols),
-                "tabular_cols_count": len(all_tabular_cols),
-                "problem_types": [s.problem_type for s in detected_schemas.values()],
-            }
+        sample_df: Optional[pd.DataFrame] = self._materialise_sample(
+            lazy_data, n=500
+        )
+
+        if sample_df is None:
+            # PyTorch Dataset or unrecognised type → treat as image dataset
+            return IndividualSchema(
+                dataset_id=dataset_id,
+                detected_columns={
+                    "image": ["__image_path__"],
+                    "text": [],
+                    "tabular": [],
+                    "timeseries": [],
+                },
+                target_column="Unknown",
+                problem_type="unsupervised",
+                modalities=["image"],
+                confidence=0.5,
+            )
+
+        return self._inspect_dataframe(dataset_id, sample_df)
+
+    # -----------------------------------------------------------------------
+    # Sample materialisation – lazy → pandas (at most n rows)
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _materialise_sample(
+        lazy_data: Any,
+        n: int = 500,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Materialise at most *n* rows from a lazy reference into a pandas
+        DataFrame.  Returns None for PyTorch Datasets (image-only sources).
+
+        Supported input types:
+          - polars.LazyFrame   → .head(n).collect().to_pandas()
+          - dask.dataframe.DataFrame → .head(n, compute=True)
+          - pandas.DataFrame   → .head(n)
+          - torch Dataset      → None  (image-only; no column structure)
+        """
+        # --- Polars LazyFrame ---
+        try:
+            import polars as pl  # noqa: F401 – guarded import
+            if isinstance(lazy_data, pl.LazyFrame):
+                return lazy_data.head(n).collect().to_pandas()
+        except ImportError:
+            pass
+
+        # --- Dask DataFrame ---
+        try:
+            import dask.dataframe as dd  # noqa: F401
+            if isinstance(lazy_data, dd.DataFrame):
+                return lazy_data.head(n, compute=True)
+        except ImportError:
+            pass
+
+        # --- Plain pandas DataFrame (legacy / already materialised) ---
+        if isinstance(lazy_data, pd.DataFrame):
+            return lazy_data.head(n)
+
+        # --- PyTorch Dataset (image collections) ---
+        try:
+            from torch.utils.data import Dataset  # noqa: F401
+            if isinstance(lazy_data, Dataset):
+                return None  # handled upstream as image-only schema
+        except ImportError:
+            pass
+
+        # Unknown type – attempt pandas coercion as last resort
+        try:
+            return pd.DataFrame(lazy_data).head(n)
+        except Exception:
+            return None
+
+    # -----------------------------------------------------------------------
+    # Core column-level analysis (runs on the pandas sample)
+    # -----------------------------------------------------------------------
+
+    def _inspect_dataframe(
+        self,
+        dataset_id: str,
+        df: pd.DataFrame,
+    ) -> IndividualSchema:
+        """
+        Run all four signals on the pandas sample and return an IndividualSchema.
+        """
+        detected: Dict[str, List[str]] = {
+            "image": [],
+            "text": [],
+            "tabular": [],
+            "timeseries": [],
         }
+
+        for col in df.columns:
+            series = df[col]
+            if self._is_image(series):
+                detected["image"].append(col)
+            elif self._is_timeseries(series):
+                detected["timeseries"].append(col)
+            elif self._is_text(series):
+                detected["text"].append(col)
+            else:
+                detected["tabular"].append(col)
+
+        target_col, confidence = self._detect_target(df)
+        problem_type = self._infer_problem(df, target_col)
+        modalities: List[str] = sorted(k for k, v in detected.items() if v)
+
+        return IndividualSchema(
+            dataset_id=dataset_id,
+            detected_columns=detected,
+            target_column=target_col,
+            problem_type=problem_type,
+            modalities=modalities,
+            confidence=confidence,
+        )
+
+    # -----------------------------------------------------------------------
+    # Column-type checks
+    # -----------------------------------------------------------------------
+
+    def _is_image(self, series: pd.Series) -> bool:
+        if series.dtype != "object":
+            return False
+        sample = series.dropna().astype(str).head(50)
+        if len(sample) == 0:
+            return False
+        hits = sum(
+            any(ext in v.lower() for ext in self.IMAGE_EXTENSIONS)
+            for v in sample
+        )
+        return hits > max(3, len(sample) * 0.3)
+
+    def _is_text(self, series: pd.Series) -> bool:
+        """
+        Return True when the column looks like free-form text.
+
+        Threshold: mean string length > 50 characters.
+        (Raised from the legacy value of 40 to better distinguish
+        short categoricals from actual prose/text fields.)
+        """
+        if series.dtype != "object":
+            return False
+        sample = series.dropna().astype(str).head(50)
+        if len(sample) == 0:
+            return False
+        return sample.str.len().mean() > 50  # spec: > 50 (was > 40)
+
+    def _is_timeseries(self, series: pd.Series) -> bool:
+        if series.dtype != "object":
+            return False
+        sample = series.dropna().astype(str).head(30)
+        if len(sample) == 0:
+            return False
+        return sample.str.contains(r"\[.*\]", na=False).mean() > 0.5
+
+    # -----------------------------------------------------------------------
+    # Target detection – 4-signal universal reasoning
+    # -----------------------------------------------------------------------
+
+    def _detect_target(
+        self,
+        df: pd.DataFrame,
+    ) -> Tuple[str, float]:
+        """
+        Universal multi-signal target detection.
+
+        Returns (best_column_name, confidence_score).
+        """
+        best_col: str = "Unknown"
+        best_score: float = 0.0
+        n_rows: int = max(len(df), 1)
+
+        for col in df.columns:
+            name = col.lower()
+            series = df[col]
+            score = 0.0
+
+            # Signal 1 – semantic keyword match
+            if any(k in name for k in self.TARGET_KEYWORDS):
+                score += 0.35
+
+            # Signal 2 – statistical behaviour (unique ratio)
+            try:
+                unique_ratio = series.nunique(dropna=True) / n_rows
+            except Exception:
+                unique_ratio = 1.0
+
+            if 0.001 < unique_ratio < 0.2:
+                score += 0.30
+            if unique_ratio < 0.01:
+                score += 0.20
+
+            if series.dtype == "object":
+                score += 0.10  # categorical hint
+
+            # Signal 3 – structural pattern (JSON / list values → multi-label)
+            if series.dtype == "object":
+                sample = series.dropna().astype(str).head(50)
+                if len(sample) > 0:
+                    json_like = sample.str.contains(r"\{.*\}", na=False).mean()
+                    list_like = sample.str.contains(r"\[.*\]", na=False).mean()
+                    if json_like > 0.3:
+                        score += 0.60
+                    if list_like > 0.3:
+                        score += 0.40
+
+            # Signal 4 – regression signal (numeric, many unique, spread out)
+            if pd.api.types.is_numeric_dtype(series):
+                nunique = series.nunique(dropna=True)
+                if nunique > 20 and unique_ratio > 0.05:
+                    score += 0.25
+
+            # Penalty for ID columns
+            if "id" in name:
+                score -= 0.45
+
+            if score > best_score:
+                best_score = score
+                best_col = col
+
+        if best_score < 0.35:
+            return "Unknown", 0.0
+
+        return best_col, round(min(best_score, 1.0), 3)
+
+    # -----------------------------------------------------------------------
+    # Problem-type inference
+    # -----------------------------------------------------------------------
+
+    def _infer_problem(self, df: pd.DataFrame, target: str) -> str:
+        """
+        Infer the ML problem type from the target column.
+
+        Rules (in priority order):
+          1. Multilabel – target values look like JSON dicts
+          2. Binary classification      – 2 unique values
+          3. Multiclass classification  – 3-20 unique integer values
+          4. Regression                 – numeric float or >20 unique values
+          5. Unsupervised               – no valid target detected
+        """
+        if target == "Unknown":
+            return "unsupervised"
+
+        s = df[target]
+
+        # Rule 1 – multilabel (JSON dict values)
+        if s.dtype == "object":
+            sample = s.dropna().astype(str).head(50)
+            if len(sample) > 0 and sample.str.contains(r"\{.*\}", na=False).mean() > 0.3:
+                return "multilabel_classification"
+
+        n_unique: int = int(s.nunique(dropna=True))
+
+        # Rule 2 – binary
+        if n_unique == 2:
+            return "classification_binary"
+
+        # Rule 3 – multiclass (small integer cardinality)
+        if 3 <= n_unique <= 20:
+            return "classification_multiclass"
+
+        # Rule 4 – regression (float dtype OR many unique numeric values)
+        if pd.api.types.is_numeric_dtype(s):
+            if pd.api.types.is_float_dtype(s) or n_unique > 20:
+                return "regression"
+            # Integer with > 20 unique values but not clearly float → multiclass
+            return "classification_multiclass"
+
+        # Categorical string with > 20 unique values → multiclass
+        return "classification_multiclass"
+
+    # -----------------------------------------------------------------------
+    # Tier-2 aggregation helpers
+    # -----------------------------------------------------------------------
+
+    def _aggregate_modalities(
+        self,
+        results: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Union all per-dataset modalities into a sorted list."""
+        mods: set = set()
+        for r in results:
+            mods.update(r.get("modalities", []))
+        return sorted(mods)
+
+    def _aggregate_problem_type(
+        self,
+        results: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Resolve a single global problem type.
+
+        Priority rule: regression beats classification (a regression dataset
+        mixed with a classification dataset should produce a regression run).
+        Otherwise use majority vote.
+        """
+        types: List[str] = [
+            r["problem_type"]
+            for r in results
+            if r.get("problem_type", "unsupervised") != "unsupervised"
+        ]
+
+        if not types:
+            return "unsupervised"
+
+        # Regression takes priority when mixed
+        if "regression" in types:
+            return "regression"
+
+        return max(set(types), key=types.count)
+
+    def _select_primary_target(
+        self,
+        results: List[Dict[str, Any]],
+    ) -> str:
+        """
+        Pick the primary target column.
+
+        Prefer the target with the highest confidence; fall back to first
+        non-Unknown value; final fallback is "Unknown".
+        """
+        best_target = "Unknown"
+        best_conf = -1.0
+        for r in results:
+            col = r.get("target_column", "Unknown")
+            conf = r.get("confidence", 0.0)
+            if col != "Unknown" and conf > best_conf:
+                best_conf = conf
+                best_target = col
+        return best_target
+
+    # -------------------------------------------------------------------
+    # Cross-dataset relatedness
+    # -------------------------------------------------------------------
+
+    def _check_relatedness(
+        self,
+        per_dataset_results: List[Dict[str, Any]],
+    ) -> Tuple[List[List[int]], Dict[str, Any]]:
+        """
+        Check pairwise relatedness of datasets and return groups.
+
+        Signals (each contributes to a [0, 1] score):
+          1. Column name overlap  (Jaccard) — weight 0.40
+          2. Target column match             — weight 0.30
+          3. Modality set overlap (Jaccard)  — weight 0.20
+          4. Problem type match              — weight 0.10
+
+        Datasets with pairwise score >= 0.5 are grouped via union-find.
+
+        Returns
+        -------
+        (groups, report)
+            groups : list of lists of dataset indices
+            report : dict with pairwise scores for logging / frontend
+        """
+        n = len(per_dataset_results)
+        if n <= 1:
+            return [list(range(n))], {"single_dataset": True, "n_groups": 1}
+
+        scores: Dict[Tuple[int, int], float] = {}
+        for i in range(n):
+            for j in range(i + 1, n):
+                a = per_dataset_results[i]
+                b = per_dataset_results[j]
+
+                # Signal 1: column overlap (Jaccard)
+                cols_a: set = set()
+                cols_b: set = set()
+                for mod_cols in a.get("detected_columns", {}).values():
+                    cols_a.update(mod_cols)
+                for mod_cols in b.get("detected_columns", {}).values():
+                    cols_b.update(mod_cols)
+                union = cols_a | cols_b
+                col_jaccard = len(cols_a & cols_b) / len(union) if union else 0.0
+
+                # Signal 2: target compatibility
+                target_match = 1.0 if (
+                    a.get("target_column", "X") == b.get("target_column", "Y")
+                    and a.get("target_column") != "Unknown"
+                ) else 0.0
+
+                # Signal 3: modality match
+                mods_a = set(a.get("modalities", []))
+                mods_b = set(b.get("modalities", []))
+                mod_union = mods_a | mods_b
+                mod_jaccard = (
+                    len(mods_a & mods_b) / len(mod_union) if mod_union else 0.0
+                )
+
+                # Signal 4: problem type match
+                prob_match = (
+                    1.0 if a.get("problem_type") == b.get("problem_type") else 0.0
+                )
+
+                score = (
+                    0.40 * col_jaccard
+                    + 0.30 * target_match
+                    + 0.20 * mod_jaccard
+                    + 0.10 * prob_match
+                )
+                scores[(i, j)] = score
+
+        # Union-Find grouping at threshold 0.5
+        parent = list(range(n))
+
+        def _find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def _union(x: int, y: int) -> None:
+            px, py = _find(x), _find(y)
+            if px != py:
+                parent[px] = py
+
+        for (i, j), score in scores.items():
+            if score >= 0.5:
+                _union(i, j)
+
+        from collections import defaultdict
+        group_map: Dict[int, List[int]] = defaultdict(list)
+        for i in range(n):
+            group_map[_find(i)].append(i)
+
+        groups = list(group_map.values())
+        report = {
+            "n_datasets": n,
+            "n_groups": len(groups),
+            "pairwise_scores": {
+                f"{i}-{j}": round(s, 3) for (i, j), s in scores.items()
+            },
+            "groups": groups,
+        }
+        return groups, report
