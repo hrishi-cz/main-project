@@ -45,9 +45,9 @@ Training machine learning models on **multimodal data** (images, free-text, and 
 ### What AutoVision+ Handles
 
 - **Multi-format ingestion** across CSV, Parquet, image directories, ZIP archives, and Kaggle datasets
-- **Multimodal preprocessing**: ResNet-50 for images, BERT tokenization for text, sklearn ColumnTransformer for tabular
+- **Multimodal preprocessing**: JIT-selected vision backbone (ConvNeXt-Tiny / ResNet-50 / MobileNetV3) for images, JIT-selected text encoder (DeBERTa-v3-small / BERT-base / TinyBERT) for text, GRN/MLP tabular encoder, sklearn ColumnTransformer for tabular feature engineering
 - **Automatic feature leakage prevention**: heuristic ID/datetime/high-uniqueness column filtering before training
-- **Cost-efficient HPO**: Optuna with HyperbandPruner and shared frozen encoders (single VRAM allocation across all trials)
+- **Cost-efficient HPO**: Optuna with HyperbandPruner, shared frozen encoders (single VRAM allocation across all trials), and per-trial trainable tabular encoders with independent random initialization
 - **Dual fusion strategies**: concatenation and learned attention-weighted fusion
 - **Production-grade training**: PyTorch Lightning with FP16 mixed precision, EarlyStopping, stratified splits, and automatic class weighting
 - **Statistical drift detection** (PSI, KS, MMD) with **autonomous retraining triggers**
@@ -73,9 +73,12 @@ Existing open-source AutoML tools leave a critical gap in multimodal fusion:
 |---|:---:|:---:|:---:|:---:|
 | Tabular AutoML | Yes | Yes | Yes | Yes |
 | Image + Text + Tabular Fusion | No | Partial | No | **Yes** |
+| JIT Hardware-Constrained Encoder Selection | N/A | No | N/A | **Yes** |
 | Shared Frozen Encoders in HPO | N/A | No | N/A | **Yes** |
+| Trainable Tabular Encoder (GRN/MLP) in HPO | No | No | No | **Yes** |
 | Automatic ID/Date Column Filtering | No | No | No | **Yes** |
 | Schema-Guided Inference UI | No | No | No | **Yes** |
+| SQLite Multi-Worker Task State | No | No | No | **Yes** |
 | Statistical Drift Detection (PSI/KS/MMD) | No | No | No | **Yes** |
 | XAI Auto-Targeting (Captum IG) | No | No | No | **Yes** |
 
@@ -100,8 +103,8 @@ graph LR
     end
 
     subgraph "Training"
-        C1 & C2 & C3 --> D[Model Selection<br/>GPU profiling + HPO space]
-        D --> E[Optuna HPO<br/>HyperbandPruner + EarlyStopping<br/>Shared frozen BERT/ResNet]
+        C1 & C2 & C3 --> D[JIT Encoder Selector<br/>VRAM profiling + constrained optimization]
+        D --> E[Optuna HPO<br/>HyperbandPruner + EarlyStopping<br/>Shared frozen Image/Text encoders<br/>Per-trial trainable Tabular encoder]
         E --> F[PyTorch Lightning Trainer<br/>FP16 mixed precision + CosineAnnealingLR]
     end
 
@@ -111,7 +114,7 @@ graph LR
     end
 
     subgraph "Serving"
-        H --> I[FastAPI Backend<br/>Async inference + LRU engine cache]
+        H --> I[FastAPI Backend<br/>Async inference + SQLite task state<br/>LRU engine cache]
         I --> J[Streamlit Frontend<br/>7-phase guided workflow]
         I --> K[Captum XAI<br/>IntegratedGradients]
     end
@@ -121,12 +124,14 @@ graph LR
 
 | Layer | Technology |
 |---|---|
-| **Core ML** | PyTorch 2.0, PyTorch Lightning, torchvision (ResNet-50), HuggingFace Transformers (BERT), torchmetrics |
-| **AutoML / HPO** | Optuna (HyperbandPruner), MLflow (experiment tracking) |
+| **Core ML** | PyTorch 2.0, PyTorch Lightning, torchvision (ConvNeXt-Tiny / ResNet-50 / MobileNetV3), HuggingFace Transformers (DeBERTa-v3-small / BERT / TinyBERT), torchmetrics |
+| **AutoML / HPO** | Optuna (HyperbandPruner), MLflow (experiment tracking), JIT Encoder Selector (VRAM-constrained optimization) |
 | **Preprocessing** | scikit-learn (ColumnTransformer, StandardScaler, OHE), Pandas, NumPy |
+| **Tabular Encoding** | Gated Residual Network (GRN) and MLP encoders with per-trial trainable weights |
 | **Drift Detection** | SciPy (KS test), custom PSI + MMD implementations |
 | **Explainability** | Captum (IntegratedGradients) |
 | **Backend API** | FastAPI, Uvicorn, Pydantic |
+| **Task State** | SQLite (WAL mode) -- multi-worker-safe task persistence via `task_store.py` |
 | **Frontend** | Streamlit, Altair, Plotly |
 | **Data I/O** | aiohttp (async downloads), Polars/Dask (lazy loading), joblib (serialization) |
 
@@ -142,15 +147,23 @@ graph LR
 
 **Impact:** Enables **full HPO sweeps on a single consumer GPU** (8 GB VRAM) without OOM crashes, even when searching over multimodal architectures that include BERT and ResNet-50.
 
-### 2. VRAM Optimization: Shared Frozen Encoders Across HPO Trials
+### 2. VRAM Optimization: JIT Hardware-Constrained Encoder Selection
 
-**Problem:** A standard HPO loop instantiates `ImageEncoder(ResNet-50)` and `TextEncoder(BERT)` inside every trial. With **~540 MB** of identical, frozen weights per trial, a 10-trial search would require **5.4 GB** of redundant VRAM just for encoder copies.
+**Problem:** A standard HPO loop instantiates `ImageEncoder(ResNet-50)` and `TextEncoder(BERT)` inside every trial. With **~540 MB** of identical, frozen weights per trial, a 10-trial search would require **5.4 GB** of redundant VRAM just for encoder copies. Worse, encoder selection was **hardcoded** -- every run used ResNet-50 + BERT regardless of available hardware, meaning 4 GB GPUs could not participate at all.
 
-**Solution:** Frozen BERT and ResNet-50 encoders are instantiated **exactly once** before the Optuna study begins and **shared by reference** across all trials. The encoders are excluded from the optimizer's parameter groups and from model checkpoints via a deliberate bypass of PyTorch's module registration system. This means each trial only allocates VRAM for its lightweight **fusion head (~2 MB)** while reusing the shared encoder pool.
+**Solution:** A **JIT (Just-In-Time) Encoder Selector** profiles available VRAM at startup and solves a constrained optimization problem: *maximize encoder capacity subject to peak VRAM <= 85% of available memory*. The selector maintains a ranked registry of vision encoders (ConvNeXt-Tiny: 768-dim/84 MB, ResNet-50: 2048-dim/100 MB, MobileNetV3: 960-dim/22 MB) and text encoders (DeBERTa-v3-small: 768-dim/280 MB, BERT-base: 768-dim/440 MB, TinyBERT: 312-dim/56 MB). Each candidate is **profiled on-device** with a dummy forward pass to measure actual peak memory, and the highest-capacity combination that fits is selected. Frozen BERT/ResNet encoders are then instantiated **exactly once** and **shared by reference** across all trials to prevent redundant VRAM allocation.
 
-**Impact:** **~99% reduction in per-trial VRAM overhead** (from ~540 MB to ~2 MB). A 10-trial multimodal HPO search that would have required ~6 GB of VRAM now fits within **~600 MB**, making enterprise-scale hyperparameter optimization feasible on **consumer-grade GPUs** and slashing cloud compute costs proportionally.
+**Impact:** Encoder selection automatically adapts to hardware -- a 24 GB workstation gets ConvNeXt-Tiny + DeBERTa-v3-small, while a 4 GB laptop falls back to MobileNetV3 + TinyBERT. No configuration required. **~99% reduction in per-trial VRAM overhead** through shared frozen encoders (from ~540 MB to ~2 MB per trial).
 
-### 3. UI/API Parity: Zero-Friction Schema-Guided Inference
+### 3. Trainable Tabular Encoding with Gated Residual Networks
+
+**Problem:** Image and text modalities have pretrained encoders that project raw data into learned 512--768-dim embedding spaces. Tabular data, however, was passed through **raw** -- its 42-dimensional feature vector was concatenated directly with the rich encoder embeddings. This representation imbalance caused the fusion head to underweight tabular signals and prevented gradient-based learning from refining tabular feature interactions.
+
+**Solution:** A **Gated Residual Network (GRN)** tabular encoder is wired into the training pipeline as a **trainable** (not frozen) submodule. The GRN applies FC1 -> ELU -> FC2 with element-wise sigmoid gating, a skip connection via a learned linear projection, LayerNorm, and a final projection to a 16-dimensional embedding. Critically, unlike image/text encoders that are shared across trials, the tabular encoder is **freshly instantiated per Optuna trial** with independent random initialization -- each trial explores a different region of the tabular encoding space. The encoder is registered as a proper `nn.Module` submodule (not bypassed via `object.__setattr__`) so its parameters participate in the optimizer and receive gradients during backpropagation.
+
+**Impact:** Tabular features contribute **learned representations** to the fusion head instead of raw values. The GRN's gating mechanism lets the network selectively amplify informative features and suppress noise. Per-trial re-initialization prevents overfitting to one encoding and enables the HPO search to explore tabular representation quality as a hyperparameter.
+
+### 4. UI/API Parity: Zero-Friction Schema-Guided Inference
 
 **Problem:** Raw training schemas include noise columns (IDs, timestamps, high-cardinality strings) that the preprocessor auto-filters during training. Without synchronization, the inference API expects these irrelevant columns, the frontend asks users to fill them in, and payloads fail validation -- causing **silent 500 errors** and user confusion.
 
@@ -164,7 +177,7 @@ graph LR
 
 **Impact:** **Zero schema mismatch errors** between training and inference. Users never see irrelevant fields, and batch uploads are validated against the exact feature contract before hitting the API.
 
-### 4. Production Resilience: Automatic Class Imbalance Correction
+### 5. Production Resilience: Automatic Class Imbalance Correction
 
 **Problem:** Medical and industrial datasets are often heavily skewed (e.g., 95% healthy, 5% pathological). Training with uniform loss weights causes the model to **predict the majority class exclusively**, achieving high accuracy but zero clinical utility.
 
@@ -172,7 +185,7 @@ graph LR
 
 **Impact:** Models trained on imbalanced datasets produce **calibrated predictions across all classes**, preventing majority-class collapse without manual intervention or external sampling strategies.
 
-### 5. Cross-Platform GPU Safety
+### 6. Cross-Platform GPU Safety
 
 **Problem:** On Windows, long-running CUDA kernels trigger the **WDDM Timeout Detection & Recovery (TDR)** mechanism, causing hard GPU resets that terminate training mid-epoch with no recovery.
 
@@ -180,13 +193,21 @@ graph LR
 
 **Impact:** **Reliable training on Windows workstations** without driver-level crashes -- critical for teams that develop locally before deploying to cloud GPUs.
 
-### 6. Fault-Isolated Async Data Ingestion
+### 7. Fault-Isolated Async Data Ingestion
 
 **Problem:** Multi-source ingestion pipelines are fragile -- a single failed URL (404, timeout) can abort the entire data loading phase.
 
 **Solution:** Downloads execute concurrently via **async I/O** with per-URL fault isolation. A failed source is logged and skipped; all remaining sources continue ingesting. **SHA-256 content hashing** provides automatic deduplication, so re-ingesting the same dataset is a **zero-cost cache hit** with no redundant network traffic.
 
 **Impact:** **Resilient multi-source ingestion** that never fails completely due to a single unavailable data source, with automatic bandwidth savings on repeated runs.
+
+### 8. Multi-Worker-Safe Async Task State with SQLite
+
+**Problem:** The FastAPI backend tracks long-running operations (inference, ingestion, training) via background tasks. The original implementation stored task state in **in-memory Python dicts** (`_TASK_STORE`, `_ingestion_tasks`, `_training_tasks`), which breaks under multi-worker Uvicorn deployments: a task submitted to worker A is invisible to worker B's poll endpoint, causing 404 errors and lost results.
+
+**Solution:** All three task stores are replaced by a **single SQLite database** (`tasks.db`) with a unified `TaskState` table. A `TaskStateManager` class handles CRUD operations with per-call connections, **WAL (Write-Ahead Logging)** journal mode for concurrent read/write, and a 5-second busy timeout for write contention. The `IngestionProgressTracker` and `TrainingProgressTracker` classes retain their original method signatures but now persist state to SQLite instead of mutating in-memory dicts. Type-specific progress data (epoch metrics, dataset lists, phase progress) is stored as JSON in a `payload` column with read-modify-write semantics. Zero external dependencies -- only Python's native `sqlite3` stdlib module.
+
+**Impact:** **Full multi-worker safety** with zero infrastructure overhead. Task state survives worker restarts, multiple Uvicorn workers share a single source of truth, and the fire-and-poll async pattern works correctly regardless of which worker handles the submission vs. the poll request. No Redis, no PostgreSQL, no external message broker.
 
 ---
 
@@ -218,9 +239,9 @@ AutoVision+ integrates Captum's IntegratedGradients for **post-hoc model explana
 
 1. **Single-Device Training** -- No distributed data parallelism. Training is limited to one GPU's memory capacity.
 2. **In-Memory Materialization** -- Polars LazyFrame and Dask DataFrame references are accepted at ingestion, but materialized into Pandas DataFrames for preprocessing. Datasets exceeding available RAM will fail.
-3. **Fixed Encoder Architectures** -- Image encoding is locked to ResNet-50; text to BERT-base. No automated encoder selection (e.g., ViT, DeBERTa).
+3. **Fixed Encoder Registries** -- The JIT encoder selector chooses from a curated registry (3 vision, 3 text, 2 tabular encoders). Adding new architectures requires manual registration in the encoder registries.
 4. **Conservative Default HPO Budget** -- Default trial count is tuned for interactive use. Production deployments should increase the search budget.
-5. **No Streaming Inference** -- The API processes batch requests synchronously per-request; no WebSocket or gRPC streaming endpoint.
+5. **No Streaming Inference** -- The API uses a fire-and-poll async pattern (SQLite-backed task state) for large batches; no WebSocket or gRPC streaming endpoint is available.
 
 ### Future Roadmap
 
@@ -228,10 +249,11 @@ AutoVision+ integrates Captum's IntegratedGradients for **post-hoc model explana
 |---|---|---|
 | P0 | **Feature Pre-computation for Frozen Encoders** | Cache BERT/ResNet embeddings to disk after the first forward pass, eliminating redundant encoder inference across HPO trials and retraining runs |
 | P0 | **Advanced SHAP Integration** | Add KernelSHAP and DeepSHAP alongside IntegratedGradients for richer, method-comparative explanations |
-| P1 | **Encoder Selection** | Auto-select vision backbone (ResNet-50 / EfficientNet / ViT) and text encoder (BERT / DeBERTa / sentence-transformers) based on dataset characteristics |
+| P1 | **Expandable Encoder Registries** | Hot-loadable encoder plugins for new vision (EfficientNet, ViT-L) and text (Flan-T5, sentence-transformers) architectures without modifying core code |
 | P1 | **Distributed Training** | PyTorch Lightning DDPStrategy for multi-GPU scaling |
 | P2 | **Streaming Inference** | WebSocket endpoint for real-time prediction streams |
 | P2 | **Time-Series Modality** | Add temporal encoder (LSTM / Transformer) for sequential data fusion |
+| P2 | **Task State Cleanup** | Automatic TTL-based cleanup of completed/failed tasks from `tasks.db` |
 | P3 | **Deployment Export** | ONNX / TorchScript export with integrated pre/post-processing for edge deployment |
 
 ---
@@ -279,6 +301,7 @@ streamlit run frontend/app_enhanced.py
 ```
 main-project/
 ├── run_api.py                     # FastAPI entrypoint (all endpoints)
+├── task_store.py                  # SQLite-backed async task state (multi-worker safe)
 ├── requirements.txt               # Pinned dependencies
 ├── frontend/
 │   └── app_enhanced.py            # Streamlit 7-phase UI
@@ -289,13 +312,14 @@ main-project/
 │   └── retraining_pipeline.py     # Drift-triggered retraining
 ├── automl/
 │   ├── trainer.py                 # PyTorch Lightning module + factory
-│   ├── advanced_selector.py       # GPU-aware model selection
-│   └── model_selector.py          # Selection API wrapper
+│   ├── jit_encoder_selector.py    # VRAM-constrained JIT encoder selection
+│   ├── advanced_selector.py       # HPO search space + fusion strategy
+│   └── model_selector.py          # Selection API wrapper (deprecated)
 ├── modelss/
 │   ├── encoders/
-│   │   ├── image.py               # ResNet-50 backbone + projection
-│   │   ├── text.py                # BERT encoder + CLS pooling
-│   │   └── tabular.py             # Pass-through tabular encoder
+│   │   ├── image.py               # Vision backbones (ConvNeXt-Tiny / ResNet-50 / MobileNetV3)
+│   │   ├── text.py                # Text encoders (DeBERTa-v3 / BERT / TinyBERT)
+│   │   └── tabular.py             # Tabular encoders (GRN + MLP, trainable)
 │   ├── fusion.py                  # Concatenation + Attention fusion
 │   └── predictor.py               # Multimodal predictor (legacy)
 ├── preprocessing/
