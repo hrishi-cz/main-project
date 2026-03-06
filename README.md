@@ -13,7 +13,6 @@
   <img src="https://img.shields.io/badge/Lightning-2.0%2B-792ee5?style=flat-square&logo=pytorchlightning" alt="Lightning"/>
   <img src="https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=flat-square&logo=fastapi" alt="FastAPI"/>
   <img src="https://img.shields.io/badge/Streamlit-1.28%2B-ff4b4b?style=flat-square&logo=streamlit" alt="Streamlit"/>
-  <img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="MIT License"/>
 </p>
 
 ---
@@ -49,7 +48,7 @@ Training machine learning models on **multimodal data** (images, free-text, and 
 - **Captum XAI** with auto-targeting of the predicted class
 - **Schema-guided inference API** and **dynamic Streamlit frontend**
 - **WebSocket streaming inference** (`/ws/predict`) with chunked progress frames for real-time batch prediction feedback
-- **Hot-loadable encoder plugins** via `config/encoder_plugins.py` for custom vision/text/tabular architectures without modifying core code
+- **Startup-loadable encoder plugins** via `config/encoder_plugins.py` for custom vision/text/tabular architectures without modifying core code
 
 ### What It Excludes
 
@@ -70,7 +69,7 @@ Training machine learning models on **multimodal data** (images, free-text, and 
 | JIT Hardware-Constrained Encoder Selection | N/A | No | N/A | **Yes** |
 | Shared Frozen Encoders in HPO | N/A | No | N/A | **Yes** |
 | Frozen Encoder Embedding Pre-computation | N/A | No | N/A | **Yes** |
-| Hot-Loadable Encoder Plugins | N/A | No | N/A | **Yes** |
+| Hot-Loadable Encoder Plugins | N/A | No | N/A | **Yes** (startup) |
 | WebSocket Streaming Inference | No | No | No | **Yes** |
 | Trainable Tabular Encoder (GRN/MLP) in HPO | No | No | No | **Yes** |
 | Automatic ID/Date Column Filtering | No | No | No | **Yes** |
@@ -100,7 +99,7 @@ graph LR
     end
 
     subgraph "Training"
-        C1 & C2 & C3 --> D[JIT Encoder Selector<br/>VRAM profiling + constrained optimization<br/>Hot-loadable encoder plugins]
+        C1 & C2 & C3 --> D[JIT Encoder Selector<br/>VRAM profiling + constrained optimization<br/>Startup-loadable encoder plugins]
         D --> D2[Embedding Pre-computation<br/>One-time frozen encoder forward pass]
         D2 --> E[Optuna HPO<br/>HyperbandPruner + EarlyStopping<br/>Shared frozen Image/Text encoders<br/>Per-trial trainable Tabular encoder]
         E --> F[PyTorch Lightning Trainer<br/>FP16 mixed precision + CosineAnnealingLR]
@@ -176,12 +175,12 @@ The pipeline has three distinct performance bottlenecks where redundant computat
 
 **Solution -- Three Specialized Cache Layers:**
 
-#### Layer 1: Data Ingestion Cache (SHA-256 Content-Addressed)
+#### Layer 1: Data Ingestion Cache (SHA-256 Source-Addressed)
 
 `data_ingestion/ingestion_manager.py`
 
-- **Mechanism:** Every ingested source (URL, file path, Kaggle slug) is hashed using SHA-256 (16-character truncated digest) after URL normalization (Kaggle slugs are canonicalized). Ingested DataFrames are persisted as Parquet files in a `cache/` directory with the hash as filename.
-- **Invalidation:** Content-addressed -- same data always produces the same hash, so no TTL or manual invalidation is needed. Re-ingesting an unchanged dataset is a zero-cost cache hit.
+- **Mechanism:** Every ingested source (URL, file path, Kaggle slug) is hashed using SHA-256 (16-character truncated digest) after URL normalization (Kaggle slugs are canonicalized). The hash is computed on the *normalized source string*, not the file contents. Ingested DataFrames are persisted in a `data/dataset_cache/` directory with the hash as subdirectory name.
+- **Invalidation:** Source-addressed -- the same source URL always produces the same hash, so no TTL or manual invalidation is needed. Re-ingesting an unchanged source is a zero-cost cache hit.
 - **Atomicity:** Metadata writes use `tempfile.mkstemp()` + `os.replace()` for atomic file replacement, preventing corrupted metadata if the process crashes mid-write.
 - **Migration:** Legacy hashes (SHA-256 on raw, non-normalized source strings) are detected and transparently upgraded to normalized hashes on first access.
 
@@ -259,7 +258,7 @@ Redis or PostgreSQL would solve cross-worker visibility but add infrastructure d
 - **Atomic Read-Modify-Write:** `merge_payload()` and `append_to_payload_list()` use `BEGIN IMMEDIATE` transactions to prevent TOCTOU races when two workers try to update the same task's payload simultaneously. On conflict, the transaction is rolled back and re-raised.
 - **Connection-Per-Operation:** Each method opens a fresh connection, executes, and closes in a `try/finally` block. This avoids SQLite's "database is locked" errors from long-held connections and is safe for multi-threaded access.
 - **Busy Timeout:** `busy_timeout=5000` (5 seconds) prevents immediate failure under write contention.
-- **Typed Trackers:** `IngestionProgressTracker` and `TrainingProgressTracker` wrap the raw `TaskStateManager` with structured update methods (`set_phase()`, `record_epoch()`, `add_dataset()`) that maintain backward-compatible method signatures from the original in-memory implementation.
+- **Typed Trackers:** `IngestionProgressTracker` and `TrainingProgressTracker` wrap the raw `TaskStateManager` with structured update methods (`set_phase()`, `log_epoch()`, `report_dataset()`) that maintain backward-compatible method signatures from the original in-memory implementation.
 
 **Why This Design:**
 SQLite is the only embedded database in Python's standard library. WAL mode gives us concurrent read/write without external infrastructure. The connection-per-operation pattern trades connection pool efficiency for correctness -- in a pipeline tool processing a handful of concurrent tasks, the overhead is negligible. `BEGIN IMMEDIATE` is used instead of `BEGIN DEFERRED` because deferred transactions can silently upgrade to write locks mid-transaction, causing unexpected `SQLITE_BUSY` errors.
@@ -429,7 +428,7 @@ main-project/
 ├── modelss/
 │   ├── encoders/
 │   │   ├── image.py               # Vision backbones (ConvNeXt-Tiny / ResNet-50 / MobileNetV3)
-│   │   ├── text.py                # Text encoders (DeBERTa-v3 / BERT / TinyBERT)
+│   │   ├── text.py                # Text encoders (DeBERTa-v3 / BERT / MiniLM-L6-v2)
 │   │   └── tabular.py             # Tabular encoders (GRN + MLP, trainable)
 │   ├── fusion.py                  # Concatenation + Attention fusion
 │   └── predictor.py               # Multimodal predictor (legacy)

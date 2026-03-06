@@ -75,6 +75,38 @@ def _sanitize_model_id(model_id: str) -> str:
         )
     return model_id
 
+
+def _resolve_xai_target(target_class: int, result: Dict[str, Any]) -> int:
+    """Resolve -1 sentinel to argmax of first prediction's confidence."""
+    if target_class >= 0:
+        return target_class
+    preds = result.get("predictions", [])
+    confs = result.get("confidences", [])
+    if not preds:
+        return 0
+    first_pred = preds[0]
+    if isinstance(first_pred, int):
+        return first_pred
+    if isinstance(first_pred, list) and confs:
+        first_conf = confs[0] if isinstance(confs[0], list) else confs
+        return int(max(range(len(first_conf)), key=lambda i: first_conf[i]))
+    return 0
+
+
+def _get_session_hashes(session_id: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """Return ingested hashes for a session, with backward-compatible fallback.
+
+    If *session_id* is provided and present in ``_session_store``, that
+    per-session dict is returned (correct under concurrency).  Otherwise
+    the legacy global ``session_ingested_hashes`` is returned.
+
+    Must be called under ``_session_lock``.
+    """
+    if session_id and session_id in _session_store:
+        return dict(_session_store[session_id])
+    # Backward-compatible: use legacy global alias
+    return dict(session_ingested_hashes)
+
 # ---------------------------------------------------------------------------
 # Pydantic models – defined BEFORE any endpoint that references them
 # ---------------------------------------------------------------------------
@@ -443,9 +475,13 @@ async def detect_schema(request: Request) -> Dict[str, Any]:
         from data_ingestion.loader import DataLoader
         from data_ingestion.schema_detector import MultiDatasetSchemaDetector
 
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        _sid = body.get("session_id") if isinstance(body, dict) else None
+
         # STRICT SESSION ISOLATION: reject if no active session
         with _session_lock:
-            if not session_ingested_hashes:
+            _session_snapshot = _get_session_hashes(_sid)
+            if not _session_snapshot:
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -453,7 +489,7 @@ async def detect_schema(request: Request) -> Dict[str, Any]:
                         "Call POST /ingest/datasets first to register datasets."
                     ),
                 )
-            _snapshot_hashes = list(session_ingested_hashes.keys())
+            _snapshot_hashes = list(_session_snapshot.keys())
 
         cache_dir = Path("./data/dataset_cache")
         loader = DataLoader()
@@ -540,8 +576,12 @@ async def preprocess_data(request: Request) -> Dict[str, Any]:
         from preprocessing.text_preprocessor import TextPreprocessor
         from preprocessing.tabular_preprocessor import TabularPreprocessor
 
+        body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+        _sid = body.get("session_id") if isinstance(body, dict) else None
+
         with _session_lock:
-            if not session_ingested_hashes:
+            _session_snapshot = _get_session_hashes(_sid)
+            if not _session_snapshot:
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -549,7 +589,7 @@ async def preprocess_data(request: Request) -> Dict[str, Any]:
                         "Call POST /ingest/datasets first to register datasets."
                     ),
                 )
-            _snapshot_hashes_pp = list(session_ingested_hashes.keys())
+            _snapshot_hashes_pp = list(_session_snapshot.keys())
 
         # ----------------------------------------------------------------
         # Load cached lazy refs for current session
@@ -831,9 +871,13 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
             Phase,
         )
 
+        body = await request.json()
+        _sid = body.get("session_id") if isinstance(body, dict) else None
+
         # STRICT SESSION ISOLATION — snapshot under lock to prevent TOCTOU race
         with _session_lock:
-            if not session_ingested_hashes:
+            _snapshot = _get_session_hashes(_sid)
+            if not _snapshot:
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -841,9 +885,7 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
                         "Call POST /ingest/datasets first to register datasets."
                     ),
                 )
-            _snapshot = dict(session_ingested_hashes)
 
-        body = await request.json()
         problem_type: str = body.get("problem_type", "classification_binary")
         modalities: List[str] = body.get("modalities", ["tabular"])
         hp_overrides: Optional[Dict[str, Any]] = body.get("hp_overrides")
@@ -1119,9 +1161,13 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
             Phase,
         )
 
+        body = await request.json()
+        _sid = body.get("session_id") if isinstance(body, dict) else None
+
         # Snapshot under lock to prevent TOCTOU race
         with _session_lock:
-            if not session_ingested_hashes:
+            _snapshot = _get_session_hashes(_sid)
+            if not _snapshot:
                 raise HTTPException(
                     status_code=400,
                     detail=(
@@ -1129,9 +1175,7 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
                         "Call POST /ingest/datasets first to register datasets."
                     ),
                 )
-            _snapshot = dict(session_ingested_hashes)
 
-        body = await request.json()
         problem_type: str = body.get("problem_type", "classification_binary")
         modalities: List[str] = body.get("modalities", ["tabular"])
         model_id: Optional[str] = body.get("model_id")
@@ -1434,23 +1478,7 @@ def _run_inference_task(
         # XAI (optional)
         explanations: Optional[Dict[str, Any]] = None
         if explain:
-            effective_target: int = target_class
-            if target_class < 0:
-                preds = result.get("predictions", [])
-                confs = result.get("confidences", [])
-                if preds:
-                    first_pred = preds[0]
-                    if isinstance(first_pred, int):
-                        effective_target = first_pred
-                    elif isinstance(first_pred, list) and confs:
-                        first_conf = confs[0] if isinstance(confs[0], list) else confs
-                        effective_target = int(
-                            max(range(len(first_conf)), key=lambda i: first_conf[i])
-                        )
-                    else:
-                        effective_target = 0
-                else:
-                    effective_target = 0
+            effective_target = _resolve_xai_target(target_class, result)
 
             explanations = engine.generate_explanations(
                 df, target_class=effective_target, n_steps=n_steps,
@@ -1670,25 +1698,7 @@ async def ws_predict(websocket: WebSocket) -> None:
                 "status": "GENERATING_EXPLANATIONS",
             })
 
-            effective_target: int = target_class
-            if target_class < 0:
-                preds = result.get("predictions", [])
-                confs = result.get("confidences", [])
-                if preds:
-                    first_pred = preds[0]
-                    if isinstance(first_pred, int):
-                        effective_target = first_pred
-                    elif isinstance(first_pred, list) and confs:
-                        first_conf = (
-                            confs[0] if isinstance(confs[0], list) else confs
-                        )
-                        effective_target = int(
-                            max(range(len(first_conf)), key=lambda i: first_conf[i])
-                        )
-                    else:
-                        effective_target = 0
-                else:
-                    effective_target = 0
+            effective_target = _resolve_xai_target(target_class, result)
 
             explanations = await asyncio.to_thread(
                 engine.generate_explanations,
@@ -1715,15 +1725,15 @@ async def ws_predict(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "error", "error": f"Invalid JSON: {e}"})
         except Exception:
             pass
-    except FileNotFoundError as fnf:
+    except FileNotFoundError:
         try:
-            await websocket.send_json({"type": "error", "error": str(fnf)})
+            await websocket.send_json({"type": "error", "error": "Model not found."})
         except Exception:
             pass
     except Exception as exc:
         logger.error("WebSocket /ws/predict error: %s", exc, exc_info=True)
         try:
-            await websocket.send_json({"type": "error", "error": str(exc)})
+            await websocket.send_json({"type": "error", "error": "Internal inference error."})
         except Exception:
             pass
     finally:
@@ -1836,25 +1846,7 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
         # Captum XAI – gradients enabled only inside generate_explanations
         explanations: Optional[Dict[str, Any]] = None
         if explain:
-            # Auto-targeting: resolve -1 sentinel to argmax of first prediction
-            effective_target: int = target_class
-            if target_class < 0:
-                preds = result.get("predictions", [])
-                confs = result.get("confidences", [])
-                if preds:
-                    first_pred = preds[0]
-                    if isinstance(first_pred, int):
-                        effective_target = first_pred
-                    elif isinstance(first_pred, list) and confs:
-                        # multilabel: pick class with highest confidence
-                        first_conf = confs[0] if isinstance(confs[0], list) else confs
-                        effective_target = int(
-                            max(range(len(first_conf)), key=lambda i: first_conf[i])
-                        )
-                    else:
-                        effective_target = 0
-                else:
-                    effective_target = 0
+            effective_target = _resolve_xai_target(target_class, result)
 
             explanations = await asyncio.to_thread(
                 engine.generate_explanations,

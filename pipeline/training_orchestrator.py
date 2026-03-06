@@ -640,9 +640,22 @@ class TrainingOrchestrator:
             # Phase 5: Training
             self._execute_phase_5_training()
             
-            # Phase 6: Drift Detection
-            self._execute_phase_6_drift_detection()
-            
+            # Phase 6: Drift Detection (fault-isolated – failure here
+            # must not prevent Phase 7 model registration)
+            try:
+                self._execute_phase_6_drift_detection()
+            except Exception as phase6_err:
+                logger.warning(
+                    "Phase 6 (drift detection) failed – continuing to Phase 7: %s",
+                    phase6_err,
+                )
+                self.phase_results[Phase.DRIFT_DETECTION] = {
+                    "status": "error",
+                    "error": str(phase6_err),
+                    "drift_detected": False,
+                    "retrain_triggered": False,
+                }
+
             # Phase 7: Model Registry
             self._execute_phase_7_model_registry()
             
@@ -1588,11 +1601,13 @@ class TrainingOrchestrator:
                     trial_wd      = hp_overrides.get("weight_decay", 1e-5)
                     trial_dropout = hp_overrides.get("dropout", 0.1)
                     trial_epochs  = hp_overrides.get("epochs", model_sel.get("epochs", 10))
+                    trial_fusion  = hp_overrides.get("fusion_strategy", model_sel.get("fusion_strategy", "concatenation"))
                 else:
                     trial_lr      = _sample(trial, "learning_rate", model_sel.get("learning_rate", 1e-3))
                     trial_wd      = _sample(trial, "weight_decay",  1e-5)
                     trial_dropout = _sample(trial, "dropout",       0.1)
                     trial_epochs  = _sample(trial, "epochs",        model_sel.get("epochs", 10))
+                    trial_fusion  = _sample(trial, "fusion_strategy", model_sel.get("fusion_strategy", "concatenation"))
 
                 # Create a FRESH tabular encoder for this trial (trainable,
                 # random init).  Image/text encoders are shared (frozen).
@@ -1614,6 +1629,7 @@ class TrainingOrchestrator:
                     text_encoder=_text_encoder,
                     tabular_encoder=_trial_tabular_encoder,
                     class_weights=_class_weights,
+                    fusion_strategy=trial_fusion,
                 )
 
                 # Build a Lightning callback to push epoch metrics in real-time

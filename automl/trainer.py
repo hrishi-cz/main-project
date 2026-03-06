@@ -33,8 +33,15 @@ logger = logging.getLogger(__name__)
 
 class _MultimodalHead(nn.Module):
     """
-    Simple fusion head that accepts one or more modality embeddings,
-    concatenates them, and projects to ``num_outputs``.
+    Fusion head that accepts one or more modality embeddings,
+    fuses them via the chosen strategy, and projects to ``num_outputs``.
+
+    ``fusion_strategy`` selects the fusion layer:
+
+    - ``"concatenation"`` (default): horizontal ``torch.cat`` via
+      :class:`~modelss.fusion.ConcatenationFusion`.
+    - ``"attention"``: learned attention-weighted fusion via
+      :class:`~modelss.fusion.AttentionFusion`.
 
     Each modality key in ``input_dims`` must match the keys that
     ``MultimodalPyTorchDataset.__getitem__`` returns (``"tabular"``,
@@ -48,12 +55,23 @@ class _MultimodalHead(nn.Module):
         hidden_dim: int = 256,
         num_outputs: int = 2,
         dropout: float = 0.1,
+        fusion_strategy: str = "concatenation",
     ) -> None:
         super().__init__()
         self._keys = sorted(input_dims.keys())  # only consume declared modalities
-        total_dim = sum(input_dims.values())
+
+        feature_dims = [input_dims[k] for k in self._keys]
+
+        if fusion_strategy == "attention":
+            from modelss.fusion import AttentionFusion
+            self.fusion = AttentionFusion(feature_dims)
+        else:
+            from modelss.fusion import ConcatenationFusion
+            self.fusion = ConcatenationFusion(feature_dims)
+
+        fused_dim = self.fusion.get_output_dim()
         self.layers = nn.Sequential(
-            nn.Linear(total_dim, hidden_dim),
+            nn.Linear(fused_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_outputs),
@@ -67,7 +85,7 @@ class _MultimodalHead(nn.Module):
                 f"Expected all of {self._keys}."
             )
         parts = [embeddings[k].float() for k in self._keys]
-        x = torch.cat(parts, dim=-1)
+        x = self.fusion(parts)
         return self.layers(x)
 
 
@@ -422,6 +440,7 @@ def build_trainer(
     text_encoder: Optional[nn.Module] = None,
     tabular_encoder: Optional[nn.Module] = None,
     class_weights: Optional[torch.Tensor] = None,
+    fusion_strategy: str = "concatenation",
 ) -> ApexLightningModule:
     """
     Build an :class:`ApexLightningModule` wrapping a fresh multimodal head.
@@ -437,6 +456,8 @@ def build_trainer(
         Frozen ``TextEncoder`` instance shared across Optuna trials.
     tabular_encoder : nn.Module | None
         Trainable tabular encoder, freshly instantiated per trial.
+    fusion_strategy : str
+        ``"concatenation"`` (default) or ``"attention"``.
 
     Returns
     -------
@@ -454,6 +475,7 @@ def build_trainer(
         hidden_dim=hidden_dim,
         num_outputs=num_outputs,
         dropout=dropout,
+        fusion_strategy=fusion_strategy,
     )
     return ApexLightningModule(
         model=head,
