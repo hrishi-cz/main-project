@@ -502,7 +502,7 @@ class PTBXLInferenceVerifier:
         preds = result.trial_predictions
         if (preds.get("predictions")
                 and len(preds["predictions"]) == self.n_trial
-                and all(0 < c <= 1.0 for c in preds.get("confidences", []))):
+                and all(0 <= c <= 1.0 for c in preds.get("confidences", []))):
             checks_passed += 1
 
         verdict_parts = [

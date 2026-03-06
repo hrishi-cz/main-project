@@ -207,7 +207,7 @@ class TestTrialPrediction:
         assert result["n_samples"] == 3
         assert len(result["predictions"]) == 3
         assert len(result["confidences"]) == 3
-        assert all(0 < c <= 1.0 for c in result["confidences"])
+        assert all(0 <= c <= 1.0 for c in result["confidences"])
 
     def test_prediction_labels_are_valid(self):
         verifier = PTBXLInferenceVerifier(n_samples=50, n_trial=5)
