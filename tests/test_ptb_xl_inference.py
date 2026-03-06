@@ -12,6 +12,7 @@ from inference.ptb_xl_inference import (
     _build_ptbxl_ecg_image,
     build_trial_inputs,
     collect_manual_input,
+    detect_relevant_features,
     _TabularStubPredictor,
     InferenceVerificationResult,
     FEATURE_COLUMNS,
@@ -384,3 +385,103 @@ class TestManualInput:
         assert pred["n_samples"] == 1
         assert len(pred["predictions"]) == 1
         assert 0 <= pred["confidences"][0] <= 1.0
+
+    def test_categorical_input_accepted(self):
+        """Categorical columns accept string values."""
+        responses = iter(["55", "NORM"])
+        result = collect_manual_input(
+            ["age", "diag"],
+            column_types={"age": "numeric", "diag": "categorical"},
+            _input_fn=lambda _prompt: next(responses),
+        )
+        assert result["age"] == 55
+        assert result["diag"] == "NORM"
+
+    def test_categorical_retries_on_empty(self):
+        """Categorical columns still reject empty input."""
+        responses = iter(["", "MI"])
+        result = collect_manual_input(
+            ["diag"],
+            column_types={"diag": "categorical"},
+            _input_fn=lambda _prompt: next(responses),
+        )
+        assert result["diag"] == "MI"
+
+
+# ---------------------------------------------------------------------------
+# Relevant feature detection tests
+# ---------------------------------------------------------------------------
+
+
+class TestDetectRelevantFeatures:
+    """Verify auto-detection of relevant feature columns from a dataset."""
+
+    def test_filters_out_ids_from_metadata(self):
+        """patient_id and ecg_id should be filtered out as ID columns."""
+        df = _build_ptbxl_metadata(100)
+        info = detect_relevant_features(df)
+        kept = info["feature_columns"]
+        dropped = info["dropped_columns"]
+        # ID-like columns should be dropped
+        assert "patient_id" not in kept
+        assert "ecg_id" not in kept
+        # Real features should be kept
+        assert "age" in kept
+        assert "sex" in kept
+
+    def test_filters_out_paths(self):
+        """File-path columns like filename_lr should be dropped."""
+        df = _build_ptbxl_metadata(100)
+        info = detect_relevant_features(df)
+        kept = info["feature_columns"]
+        assert "filename_lr" not in kept
+        assert "filename_hr" not in kept
+
+    def test_detects_target_column(self):
+        """Target column should be detected and excluded from features."""
+        df = _build_ptbxl_metadata(100)
+        info = detect_relevant_features(df)
+        target = info["target_column"]
+        assert target == "diagnostic_superclass"
+        assert target not in info["feature_columns"]
+
+    def test_column_types_populated(self):
+        """column_types dict should map each kept column to numeric or categorical."""
+        df = _build_ptbxl_metadata(100)
+        info = detect_relevant_features(df)
+        for col in info["feature_columns"]:
+            assert col in info["column_types"]
+            assert info["column_types"][col] in ("numeric", "categorical")
+
+    def test_custom_target_column(self):
+        """Explicit target_col argument is honoured."""
+        df = pd.DataFrame({
+            "a": range(100),
+            "b": np.random.randn(100),
+            "target": ["x", "y"] * 50,
+        })
+        # Force string cols to object dtype for compatibility
+        for c in df.select_dtypes(include=["string", "str"]).columns:
+            df[c] = df[c].astype(object)
+        info = detect_relevant_features(df, target_col="target")
+        assert info["target_column"] == "target"
+        assert "target" not in info["feature_columns"]
+
+    def test_dynamic_features_run_prediction(self):
+        """Detected features can drive run_trial_prediction."""
+        df = _build_ptbxl_metadata(100)
+        info = detect_relevant_features(df)
+        # Only use the numeric features for the stub predictor
+        numeric_cols = [c for c in info["feature_columns"]
+                        if info["column_types"].get(c) == "numeric"]
+        # Build a manual input from the detected columns
+        manual = {c: 0.0 for c in numeric_cols}
+        manual["age"] = 55.0
+        manual["sex"] = 1.0
+
+        verifier = PTBXLInferenceVerifier(n_samples=50, n_trial=1)
+        pred = verifier.run_trial_prediction(
+            df, [manual], feature_cols=numeric_cols,
+        )
+        assert pred["n_samples"] == 1
+        assert len(pred["predictions"]) == 1

@@ -38,6 +38,7 @@ import torch.nn as nn
 
 from data_ingestion.adapters.ecg_adapter import ECGAdapter
 from data_ingestion.schema_detector import MultiDatasetSchemaDetector
+from preprocessing.tabular_preprocessor import TabularPreprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,84 @@ def _build_ptbxl_ecg_image(n: int = 200) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Relevant feature detection from a CSV dataset
+# ---------------------------------------------------------------------------
+
+def detect_relevant_features(
+    df: pd.DataFrame,
+    target_col: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Analyse a DataFrame and determine which columns are relevant for
+    prediction using the same filtering logic as ``TabularPreprocessor``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The loaded CSV dataset.
+    target_col : str | None
+        Name of the target column.  When *None* the ECGAdapter heuristic
+        is tried first; if that fails, schema detection is used.
+
+    Returns
+    -------
+    dict with keys:
+        ``feature_columns``   – list of columns the model would actually use
+        ``dropped_columns``   – list of auto-filtered columns
+        ``target_column``     – detected / supplied target column name
+        ``column_types``      – dict mapping column name → ``"numeric"``
+                                or ``"categorical"``
+    """
+    # --- Detect target column -------------------------------------------
+    adapter = ECGAdapter()
+    if target_col is None:
+        target_col = adapter.infer_ecg_target(df)
+    if target_col == "Unknown":
+        detector = MultiDatasetSchemaDetector()
+        schema = detector.detect_global_schema({"dataset": df})
+        target_col = getattr(schema, "primary_target", "Unknown")
+
+    # --- Prepare the DataFrame for TabularPreprocessor ------------------
+    df_features = df.copy()
+    if target_col and target_col != "Unknown" and target_col in df_features.columns:
+        df_features = df_features.drop(columns=[target_col])
+
+    # --- Fit the preprocessor to learn which columns survive filtering ---
+    tp = TabularPreprocessor()
+    try:
+        tp.fit(df_features)
+    except ValueError:
+        # No usable columns found – fall back to all numeric columns
+        logger.warning("TabularPreprocessor found no usable columns; "
+                       "falling back to raw numeric columns.")
+        numeric = df_features.select_dtypes(include=[np.number]).columns.tolist()
+        return {
+            "feature_columns": numeric,
+            "dropped_columns": [],
+            "target_column": target_col if target_col != "Unknown" else "",
+            "column_types": {c: "numeric" for c in numeric},
+        }
+
+    kept = tp._feature_names_in or []
+    dropped = tp._dropped_cols or []
+
+    # --- Build column type map ------------------------------------------
+    column_types: Dict[str, str] = {}
+    for col in kept:
+        if col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+            column_types[col] = "numeric"
+        else:
+            column_types[col] = "categorical"
+
+    return {
+        "feature_columns": list(kept),
+        "dropped_columns": list(dropped),
+        "target_column": target_col if target_col != "Unknown" else "",
+        "column_types": column_types,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Trial input builders
 # ---------------------------------------------------------------------------
 
@@ -181,6 +260,7 @@ _FEATURE_HINTS: Dict[str, str] = {
 def collect_manual_input(
     feature_cols: Optional[List[str]] = None,
     *,
+    column_types: Optional[Dict[str, str]] = None,
     _input_fn=input,
 ) -> Dict[str, Any]:
     """
@@ -191,15 +271,21 @@ def collect_manual_input(
     ----------
     feature_cols : list[str] | None
         Columns to prompt for.  Defaults to ``FEATURE_COLUMNS``.
+    column_types : dict[str, str] | None
+        Mapping of column name → ``"numeric"`` or ``"categorical"``.
+        When provided, categorical columns accept string input;
+        numeric columns require a valid number.
     _input_fn : callable
         Injected ``input()`` replacement used by tests.
 
     Returns
     -------
-    dict  –  ``{column_name: numeric_value, ...}``
+    dict  –  ``{column_name: value, ...}``
     """
     if feature_cols is None:
         feature_cols = list(FEATURE_COLUMNS)
+    if column_types is None:
+        column_types = {}
 
     sep = "-" * 50
     print()
@@ -211,10 +297,13 @@ def collect_manual_input(
 
     sample: Dict[str, Any] = {}
     for col in feature_cols:
+        col_type = column_types.get(col, "numeric")
         hint = _FEATURE_HINTS.get(col, "")
         prompt = f"  {col}"
         if hint:
             prompt += f" ({hint})"
+        elif col_type == "categorical":
+            prompt += " (text)"
         prompt += ": "
 
         while True:
@@ -222,15 +311,21 @@ def collect_manual_input(
             if not raw:
                 print(f"    ⚠  Please enter a value for '{col}'.")
                 continue
-            try:
-                value = float(raw)
-                # Keep as int when appropriate (age, sex, ecg_id)
-                if value == int(value) and col in _INTEGER_COLUMNS:
-                    value = int(value)
-                sample[col] = value
+
+            if col_type == "categorical":
+                # Accept any non-empty string for categorical columns
+                sample[col] = raw
                 break
-            except ValueError:
-                print(f"    ⚠  Invalid number '{raw}'. Try again.")
+            else:
+                try:
+                    value = float(raw)
+                    # Keep as int when appropriate (age, sex, ecg_id)
+                    if value == int(value) and col in _INTEGER_COLUMNS:
+                        value = int(value)
+                    sample[col] = value
+                    break
+                except ValueError:
+                    print(f"    ⚠  Invalid number '{raw}'. Try again.")
 
     print()
     print("  ✓ Input collected:")
@@ -542,6 +637,7 @@ class PTBXLInferenceVerifier:
         self,
         df_combined: pd.DataFrame,
         trial_inputs: List[Dict[str, Any]],
+        feature_cols: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run trial predictions using a lightweight stub predictor.
@@ -549,6 +645,16 @@ class PTBXLInferenceVerifier:
         This exercises the same code-path as the real inference engine
         (tabular features → encoder → prediction) without requiring
         trained weights.
+
+        Parameters
+        ----------
+        df_combined : pd.DataFrame
+            The combined dataset used for class-label discovery.
+        trial_inputs : list[dict]
+            One dict per sample, with keys matching *feature_cols*.
+        feature_cols : list[str] | None
+            Feature columns to feed into the predictor.  Defaults to
+            ``["age", "sex", "height", "weight"]`` for backward compat.
         """
         target_col = self.adapter.infer_ecg_target(df_combined)
 
@@ -559,12 +665,19 @@ class PTBXLInferenceVerifier:
             classes = ["NORM", "MI", "STTC", "HYP", "CD"]
 
         num_classes = len(classes)
-        feature_cols = ["age", "sex", "height", "weight"]
+        if feature_cols is None:
+            feature_cols = ["age", "sex", "height", "weight"]
 
-        # Build feature tensor from trial inputs
+        # Build feature tensor from trial inputs — numeric values only
         features = []
         for inp in trial_inputs:
-            row = [float(inp.get(c, 0.0)) for c in feature_cols]
+            row: List[float] = []
+            for c in feature_cols:
+                val = inp.get(c, 0.0)
+                try:
+                    row.append(float(val))
+                except (TypeError, ValueError):
+                    row.append(0.0)
             features.append(row)
         feature_tensor = torch.tensor(features, dtype=torch.float32)
 
