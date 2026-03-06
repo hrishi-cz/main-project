@@ -39,7 +39,7 @@ Training machine learning models on **multimodal data** (images, free-text, and 
 ### What AutoVision+ Handles
 
 - **Multi-format ingestion** across CSV, Parquet, image directories, ZIP archives, and Kaggle datasets
-- **Multimodal preprocessing**: JIT-selected vision backbone (ConvNeXt-Tiny / ResNet-50 / MobileNetV3) for images, JIT-selected text encoder (DeBERTa-v3-small / BERT-base / TinyBERT) for text, GRN/MLP tabular encoder, sklearn ColumnTransformer for tabular feature engineering
+- **Multimodal preprocessing**: JIT-selected vision backbone (ConvNeXt-Tiny / ResNet-50 / MobileNetV3) for images, JIT-selected text encoder (DeBERTa-v3-base / BERT-base / MiniLM-L6-v2) for text, GRN/MLP tabular encoder, sklearn ColumnTransformer for tabular feature engineering
 - **Automatic feature leakage prevention**: heuristic ID/datetime/high-uniqueness column filtering before training
 - **Cost-efficient HPO**: Optuna with HyperbandPruner, shared frozen encoders (single VRAM allocation across all trials), frozen encoder embedding pre-computation (eliminating redundant forward passes), and per-trial trainable tabular encoders with independent random initialization
 - **Dual fusion strategies**: concatenation and learned attention-weighted fusion
@@ -122,7 +122,7 @@ graph LR
 
 | Layer | Technology |
 |---|---|
-| **Core ML** | PyTorch 2.0, PyTorch Lightning, torchvision (ConvNeXt-Tiny / ResNet-50 / MobileNetV3), HuggingFace Transformers (DeBERTa-v3-small / BERT / TinyBERT), torchmetrics |
+| **Core ML** | PyTorch 2.0, PyTorch Lightning, torchvision (ConvNeXt-Tiny / ResNet-50 / MobileNetV3), HuggingFace Transformers (DeBERTa-v3-base / BERT-base / MiniLM-L6-v2), torchmetrics |
 | **AutoML / HPO** | Optuna (HyperbandPruner), MLflow (experiment tracking), JIT Encoder Selector (VRAM-constrained optimization) |
 | **Preprocessing** | scikit-learn (ColumnTransformer, StandardScaler, OHE), Pandas, NumPy |
 | **Tabular Encoding** | Gated Residual Network (GRN) and MLP encoders with per-trial trainable weights |
@@ -154,13 +154,13 @@ Theoretical VRAM estimates (parameter count x dtype size) are inaccurate because
 
 The JIT Encoder Selector (`automl/jit_encoder_selector.py`) maintains typed registries of vision, text, and tabular encoder specifications, each recording a factory function, output dimensionality, and a human-readable name. At selection time:
 
-1. **Capacity Registry** -- Three sorted lists rank encoders by representation capacity (descending). Vision: ConvNeXt-Tiny (512-dim) > ResNet-50 (512-dim) > MobileNetV3 (512-dim). Text: DeBERTa-v3-small (768-dim) > BERT-base (768-dim) > TinyBERT (768-dim). Tabular: GRN (16-dim) > MLP (16-dim).
+1. **Capacity Registry** -- Three sorted lists rank encoders by parameter count (descending). Vision: ConvNeXt-Tiny (28.6M params, 512-dim) > ResNet-50 (25.6M, 512-dim) > MobileNetV3-Small (2.5M, 512-dim). Text: DeBERTa-v3-base (768-dim) > BERT-base (768-dim) > MiniLM-L6-v2 (384-dim, projected to 768). Tabular: GRN (16-dim) > MLP (16-dim).
 
 2. **Exhaustive Search** -- The selector enumerates the Cartesian product of all vision x text candidates (3 x 3 = 9 combinations). Combinations are sorted descending by total capacity so the first feasible solution found is guaranteed to be the maximum-capacity fit.
 
-3. **Dummy-Forward VRAM Profiling** -- Each candidate combination is instantiated on GPU, a synthetic batch (batch_size=2) is passed through, and `torch.cuda.max_memory_allocated()` records actual peak VRAM. A safety margin (eta = 0.85) reserves 15% of total VRAM for optimizer state and activations during training.
+3. **Dummy-Forward VRAM Profiling** -- Each candidate combination is instantiated on GPU, a synthetic batch is passed through, and `torch.cuda.max_memory_allocated()` records actual peak VRAM. A safety margin (eta = 0.85) reserves 15% of total VRAM for optimizer state and activations during training.
 
-4. **Graceful Degradation** -- If no GPU combination fits, the selector falls back to CPU with the smallest encoders (MobileNetV3 + TinyBERT). The fallback path still returns valid encoder specs so downstream code requires no special handling.
+4. **Graceful Degradation** -- If no GPU combination fits, the selector falls back to CPU with the smallest encoders (MobileNetV3-Small + MiniLM-L6-v2). The fallback path still returns valid encoder specs so downstream code requires no special handling.
 
 5. **Public Registration API** -- `register_vision_encoder()`, `register_text_encoder()`, `register_tabular_encoder()` allow external code to inject custom encoders that are automatically sorted into the capacity ranking and participate in constrained selection. A plugin file (`config/encoder_plugins.py`) is loaded at startup.
 
@@ -183,7 +183,7 @@ The pipeline has three distinct performance bottlenecks where redundant computat
 - **Mechanism:** Every ingested source (URL, file path, Kaggle slug) is hashed using SHA-256 (16-character truncated digest) after URL normalization (Kaggle slugs are canonicalized). Ingested DataFrames are persisted as Parquet files in a `cache/` directory with the hash as filename.
 - **Invalidation:** Content-addressed -- same data always produces the same hash, so no TTL or manual invalidation is needed. Re-ingesting an unchanged dataset is a zero-cost cache hit.
 - **Atomicity:** Metadata writes use `tempfile.mkstemp()` + `os.replace()` for atomic file replacement, preventing corrupted metadata if the process crashes mid-write.
-- **Migration:** Legacy MD5-based hashes are detected and transparently upgraded to SHA-256 on first access.
+- **Migration:** Legacy hashes (SHA-256 on raw, non-normalized source strings) are detected and transparently upgraded to normalized hashes on first access.
 
 #### Layer 2: Frozen Encoder Embedding Pre-computation (Tensor Cache)
 
@@ -231,7 +231,7 @@ The preprocessing phase auto-filters noise columns (IDs, timestamps, high-cardin
 
 **Solution -- 3-Layer Feature Contract:**
 
-1. **Preprocessing Layer** (`preprocessing/tabular_preprocessor.py`) -- Heuristic ID detection uses regex word-boundary matching (`(?:^|_)id(?:$|_)`) on column names, uniqueness-ratio thresholds (>0.95), and datetime string probing. Filtered columns are recorded, and the surviving column list is persisted as `effective_features` inside the serialized preprocessor artifact.
+1. **Preprocessing Layer** (`preprocessing/tabular_preprocessor.py`) -- Heuristic ID detection uses regex word-boundary matching (`(?:^|_)(?:id|idx|index|key|serial|pk|fk)(?:$|_)`) on column names, uniqueness-ratio thresholds (>0.5 for categorical, >0.9 for integer columns), and datetime string probing. Filtered columns are recorded, and the surviving column list is persisted as `_feature_names_in` inside the serialized preprocessor artifact (exposed as `effective_features` by the API layer).
 
 2. **API Layer** (`run_api.py`) -- The `/model-info/{model_id}` endpoint loads the fitted preprocessor from the model registry and returns only the columns the model actually uses, plus a separate list of auto-dropped columns for transparency. Model IDs are validated with regex (`^[\w\-.:]+$`) and `..` rejection to prevent directory traversal.
 
@@ -254,7 +254,7 @@ Redis or PostgreSQL would solve cross-worker visibility but add infrastructure d
 
 `task_store.py` implements a `TaskStateManager` with:
 
-- **Single Table Schema:** `TaskState(task_id TEXT PK, status TEXT, payload TEXT, created REAL, updated REAL)`. Type-specific progress data (epoch metrics, dataset lists, phase progress) is stored as JSON in the `payload` column.
+- **Single Table Schema:** `TaskState(task_id TEXT PK, task_type TEXT, status TEXT, result TEXT, error TEXT, payload TEXT DEFAULT '{}', created_at TEXT)`. Type-specific progress data (epoch metrics, dataset lists, phase progress) is stored as JSON in the `payload` column.
 - **WAL Mode:** `PRAGMA journal_mode=WAL` enables concurrent readers during writes. Multiple Uvicorn workers can poll task status while another worker updates it.
 - **Atomic Read-Modify-Write:** `merge_payload()` and `append_to_payload_list()` use `BEGIN IMMEDIATE` transactions to prevent TOCTOU races when two workers try to update the same task's payload simultaneously. On conflict, the transaction is rolled back and re-raised.
 - **Connection-Per-Operation:** Each method opens a fresh connection, executes, and closes in a `try/finally` block. This avoids SQLite's "database is locked" errors from long-held connections and is safe for multi-threaded access.
@@ -326,6 +326,7 @@ CONNECTED -> LOADING_MODEL -> PROCESSING -> progress (per 100 rows) -> GENERATIN
 - Error frames (`{"type": "error", ...}`) handle invalid model IDs, malformed JSON, and batch size limits (10K max)
 - `WebSocketDisconnect` is caught gracefully -- no server-side crash or resource leak
 - The existing REST endpoints (`/predict`, `/predict-async`) remain fully functional and unchanged
+- The Streamlit frontend uses REST polling for inference; the WebSocket endpoint is designed for programmatic clients and custom frontends that benefit from sub-second streaming feedback
 
 ---
 

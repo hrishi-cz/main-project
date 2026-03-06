@@ -952,7 +952,7 @@ def render_phase_5_training():
     messages = task.get("messages", [])
 
     # Progress bar
-    st.progress(progress_pct / 100, text=f"Phase {current_phase}/5: {current_phase_name} ({progress_pct}%)")
+    st.progress(progress_pct / 100, text=f"Phase {current_phase}/7: {current_phase_name} ({progress_pct}%)")
 
     # ----- Live epoch metrics (during training) -----
     epoch_metrics = task.get("epoch_metrics", [])
