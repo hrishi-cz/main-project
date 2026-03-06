@@ -48,7 +48,8 @@ class ModelRegistry:
     ) -> str:
         """Register a trained model."""
         timestamp = datetime.now().isoformat()
-        model_id = f"{model_name}_{timestamp}"
+        safe_timestamp = timestamp.replace(":", "-")
+        model_id = f"{model_name}_{safe_timestamp}"
         
         # Save model
         model_path = os.path.join(self.registry_path, f"{model_id}.pth")
@@ -66,11 +67,11 @@ class ModelRegistry:
         
         return model_id
     
-    def load_model(self, model_id: str) -> Optional[torch.nn.Module]:
-        """Load model by ID."""
+    def load_model(self, model_id: str) -> Optional[Dict]:
+        """Load model state_dict by ID. Returns the state_dict (OrderedDict), not an nn.Module."""
         model_path = os.path.join(self.registry_path, f"{model_id}.pth")
         if os.path.exists(model_path):
-            return torch.load(model_path)
+            return torch.load(model_path, weights_only=True)
         return None
     
     def list_models(self) -> List[str]:

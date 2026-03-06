@@ -87,3 +87,78 @@ class TabularEncoder(nn.Module):
     def get_output_dim(self) -> int:
         """Return the fixed output dimensionality (16)."""
         return TABULAR_OUTPUT_DIM
+
+
+class GRNTabularEncoder(nn.Module):
+    """
+    Gated Residual Network encoder for preprocessed tabular feature vectors.
+
+    Architecture (adapted from Temporal Fusion Transformers)::
+
+        FC1:  Linear(input_dim, hidden_dim) -> ELU
+        FC2:  Linear(hidden_dim, hidden_dim)
+        Gate: Sigmoid(Linear(input_dim, hidden_dim))
+        Skip: Linear(input_dim, hidden_dim)
+        Out:  LayerNorm(gate * FC2 + skip) -> Linear(hidden_dim, 16)
+
+    Parameters
+    ----------
+    input_dim : int
+        Number of features from upstream ``ColumnTransformer``.
+    hidden_dim : int
+        Width of GRN hidden layers.  Default 64.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int = 64) -> None:
+        super().__init__()
+        self.input_dim: int = input_dim
+
+        # Core transformation
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.elu = nn.ELU()
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+
+        # Gating mechanism
+        self.gate_linear = nn.Linear(input_dim, hidden_dim)
+        self.gate_activation = nn.Sigmoid()
+
+        # Skip (residual) connection — projects input to hidden_dim
+        self.skip = nn.Linear(input_dim, hidden_dim)
+
+        # Normalization + final projection
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.output_projection = nn.Linear(hidden_dim, TABULAR_OUTPUT_DIM)
+
+        logger.info(
+            "GRNTabularEncoder: input_dim=%d  hidden_dim=%d  output_dim=%d",
+            input_dim, hidden_dim, TABULAR_OUTPUT_DIM,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Encode a batch of tabular feature vectors.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Float tensor of shape ``(N, input_dim)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(N, 16)`` — encoded tabular embeddings.
+        """
+        h = self.elu(self.fc1(x))
+        h = self.fc2(h)
+
+        gate = self.gate_activation(self.gate_linear(x))
+        h = gate * h
+
+        skip = self.skip(x)
+        h = self.layer_norm(h + skip)
+
+        return self.output_projection(h)
+
+    def get_output_dim(self) -> int:
+        """Return the fixed output dimensionality (16)."""
+        return TABULAR_OUTPUT_DIM

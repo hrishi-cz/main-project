@@ -113,10 +113,11 @@ class ApexLightningModule(pl.LightningModule):
         max_epochs: int = 10,
         image_encoder: Optional[nn.Module] = None,
         text_encoder: Optional[nn.Module] = None,
+        tabular_encoder: Optional[nn.Module] = None,
         class_weights: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
-        self.save_hyperparameters(ignore=["model", "image_encoder", "text_encoder", "class_weights"])
+        self.save_hyperparameters(ignore=["model", "image_encoder", "text_encoder", "tabular_encoder", "class_weights"])
 
         self.model = model
         self.problem_type = problem_type
@@ -130,6 +131,11 @@ class ApexLightningModule(pl.LightningModule):
         # This prevents ~540 MB (BERT + ResNet) bloating every checkpoint.
         object.__setattr__(self, "_image_encoder", image_encoder)
         object.__setattr__(self, "_text_encoder", text_encoder)
+
+        # TRAINABLE tabular encoder: registered as a proper nn.Module
+        # submodule so its parameters ARE included in self.parameters()
+        # and the optimizer.  Created fresh per Optuna trial.
+        self.tabular_encoder = tabular_encoder
 
         # ── Loss function (with optional class weights for imbalanced data) ──
         if problem_type == "classification_binary":
@@ -207,12 +213,17 @@ class ApexLightningModule(pl.LightningModule):
 
         head_keys = getattr(self.model, "_keys", [])
 
-        # ── Tabular: direct pass-through ──────────────────────────────
+        # ── Tabular: route through trainable encoder (WITH gradient flow) ──
         if "tabular" in batch:
-            encoded["tabular"] = batch["tabular"]
+            if self.tabular_encoder is not None:
+                encoded["tabular"] = self.tabular_encoder(batch["tabular"])
+            else:
+                encoded["tabular"] = batch["tabular"]
 
-        # ── Text: route through frozen BERT → CLS token ──────────────
-        if "input_ids" in batch and self._text_encoder is not None:
+        # ── Text: use pre-computed embedding or route through frozen BERT ──
+        if "text_pooled" in batch:
+            encoded["text_pooled"] = batch["text_pooled"]
+        elif "input_ids" in batch and self._text_encoder is not None:
             with torch.no_grad():
                 outputs = self._text_encoder.transformer(
                     input_ids=batch["input_ids"],
@@ -224,8 +235,10 @@ class ApexLightningModule(pl.LightningModule):
                     cls_token = self._text_encoder._projection(cls_token)
                 encoded["text_pooled"] = cls_token
 
-        # ── Image: route through frozen ImageEncoder ──────────────────
-        if "image" in batch and self._image_encoder is not None:
+        # ── Image: use pre-computed embedding or route through frozen encoder ─
+        if "image_pooled" in batch:
+            encoded["image_pooled"] = batch["image_pooled"]
+        elif "image" in batch and self._image_encoder is not None:
             with torch.no_grad():
                 encoded["image_pooled"] = self._image_encoder(batch["image"])
 
@@ -244,9 +257,12 @@ class ApexLightningModule(pl.LightningModule):
                 elif key == "image_pooled":
                     dim = 512
                 elif key == "tabular":
-                    # Tabular dim = total_dim minus other modality dims
-                    other = sum(768 if k == "text_pooled" else 512 if k == "image_pooled" else 0 for k in head_keys if k != "tabular")
-                    dim = self.model.layers[0].in_features - other
+                    # Use encoder output dim if available, else derive from head
+                    if self.tabular_encoder is not None:
+                        dim = self.tabular_encoder.get_output_dim()
+                    else:
+                        other = sum(768 if k == "text_pooled" else 512 if k == "image_pooled" else 0 for k in head_keys if k != "tabular")
+                        dim = self.model.layers[0].in_features - other
                 encoded[key] = torch.full(
                     (N, dim), 1e-7,
                     dtype=torch.float32,
@@ -404,6 +420,7 @@ def build_trainer(
     hidden_dim: int = 256,
     image_encoder: Optional[nn.Module] = None,
     text_encoder: Optional[nn.Module] = None,
+    tabular_encoder: Optional[nn.Module] = None,
     class_weights: Optional[torch.Tensor] = None,
 ) -> ApexLightningModule:
     """
@@ -418,6 +435,8 @@ def build_trainer(
         Frozen ``ImageEncoder`` instance shared across Optuna trials.
     text_encoder : nn.Module | None
         Frozen ``TextEncoder`` instance shared across Optuna trials.
+    tabular_encoder : nn.Module | None
+        Trainable tabular encoder, freshly instantiated per trial.
 
     Returns
     -------
@@ -445,5 +464,6 @@ def build_trainer(
         max_epochs=max_epochs,
         image_encoder=image_encoder,
         text_encoder=text_encoder,
+        tabular_encoder=tabular_encoder,
         class_weights=class_weights,
     )

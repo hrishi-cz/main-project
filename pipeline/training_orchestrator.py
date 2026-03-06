@@ -37,7 +37,6 @@ from preprocessing.tabular_preprocessor import TabularPreprocessor
 
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -63,19 +62,6 @@ class TrainingConfig:
     val_split: float = 0.2
     seed: int = 42
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-@dataclass
-class SchemaInfo:
-    """Schema information from Phase 2."""
-    image_columns: List[str]
-    text_columns: List[str]
-    tabular_columns: List[str]
-    target_column: str
-    problem_type: str
-    modalities: List[str]
-    column_types: Dict[str, str]
-    confidence_scores: Dict[str, float]
 
 
 @dataclass
@@ -143,6 +129,8 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
         text_preprocessor=None,
         image_preprocessor=None,
         apply_augmentation: bool = False,
+        precomputed_text_embeddings: Optional[torch.Tensor] = None,
+        precomputed_image_embeddings: Optional[torch.Tensor] = None,
     ) -> None:
         self.df = df.reset_index(drop=True)
         self.targets = targets
@@ -153,6 +141,9 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
         # When True, image_preprocessor.augment() is applied before the
         # standard Resize+Normalize pipeline (training split only).
         self.apply_augmentation: bool = apply_augmentation
+        # Pre-computed frozen encoder embeddings (set after JIT selection)
+        self._precomputed_text: Optional[torch.Tensor] = precomputed_text_embeddings
+        self._precomputed_image: Optional[torch.Tensor] = precomputed_image_embeddings
 
         # Pre-compute column groupings from schema
         per_ds = schema_info.get("per_dataset", [{}])
@@ -184,18 +175,22 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
         if self._tabular_array is not None:
             sample["tabular"] = self._tabular_array[idx]
 
-        # Text (first text column)
-        if self.text_preprocessor is not None and self._text_cols:
+        # Text: use pre-computed embedding if available, else tokenize
+        if self._precomputed_text is not None and self._text_cols:
+            sample["text_pooled"] = self._precomputed_text[idx]
+        elif self.text_preprocessor is not None and self._text_cols:
             text_val = str(row[self._text_cols[0]])
             enc = self.text_preprocessor(text_val)
             sample["input_ids"] = enc["input_ids"]
             sample["attention_mask"] = enc["attention_mask"]
 
-        # Image (first image column contains file path)
+        # Image: use pre-computed embedding if available, else load + preprocess
         # Training datasets apply RandomFlip/Rotate/ColorJitter augmentation
         # before Resize+Normalize.  Validation/test datasets skip augmentation
         # so metrics are computed on deterministic, unperturbed inputs.
-        if self.image_preprocessor is not None and self._image_cols:
+        if self._precomputed_image is not None and self._image_cols:
+            sample["image_pooled"] = self._precomputed_image[idx]
+        elif self.image_preprocessor is not None and self._image_cols:
             try:
                 from PIL import Image as PILImage
                 img_path = str(row[self._image_cols[0]])
@@ -209,6 +204,377 @@ class MultimodalPyTorchDataset(torch.utils.data.Dataset):
                 sample["image"] = torch.zeros(3, h, w, dtype=torch.float32)
 
         return sample
+
+
+# ---------------------------------------------------------------------------
+# Frozen encoder pre-computation helpers
+# ---------------------------------------------------------------------------
+
+def _precompute_text_embeddings(
+    dataset: MultimodalPyTorchDataset,
+    text_encoder,
+    device: torch.device,
+    batch_size: int = 32,
+) -> torch.Tensor:
+    """Run frozen text encoder over all samples once.
+
+    Returns a ``[N, output_dim]`` float32 CPU tensor aligned to the
+    dataset's row indices so that ``Subset`` indexing works correctly.
+    """
+    from torch.utils.data import DataLoader
+
+    text_encoder.eval()
+    all_embeds: List[torch.Tensor] = []
+    n = len(dataset)
+
+    # Iterate through dataset manually to collect tokenized text
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        input_ids_list = []
+        attn_mask_list = []
+        for i in range(start, end):
+            sample = dataset[i]
+            input_ids_list.append(sample["input_ids"])
+            attn_mask_list.append(sample["attention_mask"])
+
+        input_ids = torch.stack(input_ids_list).to(device)
+        attn_mask = torch.stack(attn_mask_list).to(device)
+
+        with torch.no_grad():
+            outputs = text_encoder.transformer(
+                input_ids=input_ids,
+                attention_mask=attn_mask,
+            )
+            cls_token = outputs.last_hidden_state[:, 0, :]
+            if text_encoder._projection is not None:
+                cls_token = text_encoder._projection(cls_token)
+            all_embeds.append(cls_token.cpu())
+
+    return torch.cat(all_embeds, dim=0)
+
+
+def _precompute_image_embeddings(
+    dataset: MultimodalPyTorchDataset,
+    image_encoder,
+    device: torch.device,
+    batch_size: int = 32,
+) -> torch.Tensor:
+    """Run frozen image encoder over all samples once.
+
+    Returns a ``[N, output_dim]`` float32 CPU tensor aligned to the
+    dataset's row indices.  Must only be used on datasets **without**
+    augmentation (validation split) to ensure deterministic embeddings.
+    """
+    image_encoder.eval()
+    all_embeds: List[torch.Tensor] = []
+    n = len(dataset)
+
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        img_list = []
+        for i in range(start, end):
+            sample = dataset[i]
+            img_list.append(sample["image"])
+
+        images = torch.stack(img_list).to(device)
+
+        with torch.no_grad():
+            embeds = image_encoder(images)
+            all_embeds.append(embeds.cpu())
+
+    return torch.cat(all_embeds, dim=0)
+
+
+# ---------------------------------------------------------------------------
+# Out-of-core streaming dataset for 100 GB+ datasets
+# ---------------------------------------------------------------------------
+
+class AutoVisionIterableDataset(torch.utils.data.IterableDataset):
+    """
+    Out-of-core streaming :class:`IterableDataset` for datasets that
+    exceed available RAM.
+
+    Instead of materialising the full DataFrame, this class reads the
+    backing CSV / Parquet file(s) in fixed-size chunks via
+    ``pd.read_csv(chunksize=…)`` or ``pd.read_parquet`` with row-group
+    slicing.  Preprocessing (tabular scaling, BERT tokenization, image
+    resize+normalize) is applied lazily **inside the generator yield
+    loop** so only ``chunksize`` rows are ever resident in memory.
+
+    Multi-worker safety
+    -------------------
+    When ``DataLoader(num_workers > 0)``, each worker receives a copy of
+    this object.  ``__iter__`` inspects ``torch.utils.data.get_worker_info()``
+    and mathematically partitions chunks across workers so that no two
+    workers process the same row.
+
+    Batch dictionary contract
+    -------------------------
+    Each yielded sample is a ``dict`` with the **exact same keys** as
+    ``MultimodalPyTorchDataset.__getitem__``::
+
+        {
+            "target":          torch.Tensor,          # always
+            "tabular":         torch.Tensor [D],      # when tabular_preprocessor is set
+            "input_ids":       torch.LongTensor [128], # when text_preprocessor is set
+            "attention_mask":  torch.LongTensor [128], # when text_preprocessor is set
+            "image":           torch.Tensor [3,224,224] # when image_preprocessor is set
+        }
+
+    Parameters
+    ----------
+    file_paths : list[str | Path]
+        One or more CSV or Parquet file paths to stream from.
+    target_column : str
+        Name of the target column in the underlying files.
+    schema_info : dict
+        Phase 2 schema output (``asdict(GlobalSchema)``).
+    target_encoder : object | None
+        Fitted ``LabelEncoder``, ``StandardScaler``, or multilabel dict
+        from Phase 3 target encoding.
+    tabular_preprocessor : TabularPreprocessor | None
+        Fitted tabular transformer.
+    text_preprocessor : TextPreprocessor | None
+        Callable BERT tokeniser.
+    image_preprocessor : ImagePreprocessor | None
+        Callable torchvision pipeline.
+    chunksize : int
+        Number of rows to read per chunk.  Controls peak memory usage.
+        Default 4096 balances I/O throughput against RAM.
+    apply_augmentation : bool
+        When True, image augmentation is applied (training split).
+    indices : list[int] | None
+        Optional subset of global row indices to yield.  Used by the
+        orchestrator to implement train/val splits without requiring a
+        data-duplicating Subset wrapper.
+    """
+
+    def __init__(
+        self,
+        file_paths: "List[Union[str, Path]]",
+        target_column: str,
+        schema_info: dict,
+        target_encoder=None,
+        tabular_preprocessor=None,
+        text_preprocessor=None,
+        image_preprocessor=None,
+        chunksize: int = 4096,
+        apply_augmentation: bool = False,
+        indices: "Optional[List[int]]" = None,
+    ) -> None:
+        super().__init__()
+        self._file_paths = [Path(p) for p in file_paths]
+        self._target_column = target_column
+        self._schema_info = schema_info
+        self._target_encoder = target_encoder
+        self._tabular_preprocessor = tabular_preprocessor
+        self._text_preprocessor = text_preprocessor
+        self._image_preprocessor = image_preprocessor
+        self._chunksize = chunksize
+        self._apply_augmentation = apply_augmentation
+        self._indices = set(indices) if indices is not None else None
+
+        # Pre-compute column groupings from schema (same logic as map-style)
+        per_ds = schema_info.get("per_dataset", [{}])
+        detected = per_ds[0].get("detected_columns", {}) if per_ds else {}
+        self._text_cols: List[str] = detected.get("text", [])
+        self._image_cols: List[str] = detected.get("image", [])
+
+    # ------------------------------------------------------------------ #
+    #  Target encoding (mirrors Phase 3 logic)
+    # ------------------------------------------------------------------ #
+
+    def _encode_target(self, y_series: "pd.Series") -> torch.Tensor:
+        """Encode a chunk's target column using the fitted Phase 3 encoder."""
+        enc = self._target_encoder
+        if enc is None:
+            # Fallback: raw float
+            return torch.tensor(y_series.values.astype(float), dtype=torch.float32)
+
+        if isinstance(enc, dict) and enc.get("type") == "multilabel":
+            import ast
+            label_to_idx = enc["label_to_idx"]
+            n_classes = len(enc["all_labels"])
+            parsed = y_series.astype(str).apply(
+                lambda v: ast.literal_eval(v) if v.startswith("{") else {v: 1.0}
+            )
+            multi_hot = np.zeros((len(parsed), n_classes), dtype=np.float32)
+            for row_i, d in enumerate(parsed):
+                for lbl, val in d.items():
+                    if lbl in label_to_idx:
+                        multi_hot[row_i, label_to_idx[lbl]] = float(val) / 100.0
+            return torch.tensor(multi_hot, dtype=torch.float32)
+
+        if hasattr(enc, "transform"):
+            # LabelEncoder or StandardScaler
+            try:
+                encoded = enc.transform(y_series.astype(str))
+                if hasattr(enc, "classes_"):
+                    return torch.tensor(encoded, dtype=torch.long)
+                # StandardScaler for regression
+                return torch.tensor(
+                    encoded.ravel() if encoded.ndim > 1 else encoded,
+                    dtype=torch.float32,
+                )
+            except Exception:
+                return torch.tensor(y_series.values.astype(float), dtype=torch.float32)
+
+        return torch.tensor(y_series.values.astype(float), dtype=torch.float32)
+
+    # ------------------------------------------------------------------ #
+    #  Chunk reader generators
+    # ------------------------------------------------------------------ #
+
+    def _read_chunks(self, filepath: Path):
+        """
+        Yield ``(chunk_df, global_start_row)`` tuples from a single file.
+
+        CSV → ``pd.read_csv(chunksize=…)`` (native streaming).
+        Parquet → row-group-aligned slicing via ``pd.read_parquet``.
+        """
+        if filepath.suffix == ".parquet":
+            try:
+                import pyarrow.parquet as pq
+                pf = pq.ParquetFile(str(filepath))
+                global_offset = 0
+                for batch in pf.iter_batches(batch_size=self._chunksize):
+                    chunk = batch.to_pandas()
+                    yield chunk, global_offset
+                    global_offset += len(chunk)
+                return
+            except ImportError:
+                # Fall back to reading full file (degrades gracefully)
+                df = pd.read_parquet(str(filepath))
+                for start in range(0, len(df), self._chunksize):
+                    chunk = df.iloc[start:start + self._chunksize]
+                    yield chunk, start
+                return
+
+        # CSV: native chunked reader — O(chunksize) RAM
+        reader = pd.read_csv(str(filepath), chunksize=self._chunksize)
+        global_offset = 0
+        for chunk in reader:
+            yield chunk, global_offset
+            global_offset += len(chunk)
+
+    # ------------------------------------------------------------------ #
+    #  Core iterator with worker sharding
+    # ------------------------------------------------------------------ #
+
+    def __iter__(self):
+        """
+        Yield one sample dict per row, applying preprocessing lazily.
+
+        Multi-worker sharding
+        ---------------------
+        ``torch.utils.data.get_worker_info()`` returns ``None`` in the
+        main process and a ``WorkerInfo(id, num_workers)`` in workers.
+        We assign each chunk to ``worker_id = chunk_index % num_workers``
+        so that no two workers process the same data and every chunk is
+        covered exactly once across the worker pool.
+        """
+        from torch.utils.data import get_worker_info
+
+        worker_info = get_worker_info()
+        worker_id = 0
+        num_workers = 1
+        if worker_info is not None:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+
+        global_row_idx = 0
+        chunk_counter = 0
+
+        for filepath in self._file_paths:
+            if not filepath.exists():
+                logger.warning(
+                    "AutoVisionIterableDataset: file not found: %s", filepath
+                )
+                continue
+
+            for chunk_df, _offset in self._read_chunks(filepath):
+                # Worker sharding: this worker only processes its assigned chunks
+                if chunk_counter % num_workers != worker_id:
+                    global_row_idx += len(chunk_df)
+                    chunk_counter += 1
+                    continue
+                chunk_counter += 1
+
+                # Separate target from features
+                if self._target_column in chunk_df.columns:
+                    y_chunk = chunk_df[self._target_column]
+                    feature_chunk = chunk_df.drop(columns=[self._target_column])
+                else:
+                    y_chunk = chunk_df.iloc[:, -1]
+                    feature_chunk = chunk_df.iloc[:, :-1]
+
+                # Encode targets for this chunk
+                targets = self._encode_target(y_chunk)
+
+                # Identify column groups within this chunk
+                text_cols = [c for c in self._text_cols if c in feature_chunk.columns]
+                image_cols = [c for c in self._image_cols if c in feature_chunk.columns]
+                tabular_cols = [
+                    c for c in feature_chunk.columns
+                    if c not in text_cols and c not in image_cols
+                ]
+
+                # Pre-transform tabular block for the entire chunk (vectorised)
+                tabular_array = None
+                if self._tabular_preprocessor is not None and tabular_cols:
+                    try:
+                        tabular_array = torch.tensor(
+                            self._tabular_preprocessor.transform(
+                                feature_chunk[tabular_cols]
+                            ),
+                            dtype=torch.float32,
+                        )
+                    except Exception as tab_exc:
+                        logger.warning(
+                            "AutoVisionIterableDataset: tabular transform "
+                            "failed on chunk: %s", tab_exc,
+                        )
+
+                # Yield individual samples from the chunk
+                for i in range(len(chunk_df)):
+                    row_global = global_row_idx + i
+
+                    # Index filtering (train/val split)
+                    if self._indices is not None and row_global not in self._indices:
+                        continue
+
+                    sample: dict = {"target": targets[i]}
+
+                    # Tabular
+                    if tabular_array is not None:
+                        sample["tabular"] = tabular_array[i]
+
+                    # Text (first text column, lazy BERT tokenization)
+                    if self._text_preprocessor is not None and text_cols:
+                        text_val = str(feature_chunk.iloc[i][text_cols[0]])
+                        enc = self._text_preprocessor(text_val)
+                        sample["input_ids"] = enc["input_ids"]
+                        sample["attention_mask"] = enc["attention_mask"]
+
+                    # Image (lazy PIL load + resize + normalize)
+                    if self._image_preprocessor is not None and image_cols:
+                        try:
+                            from PIL import Image as PILImage
+                            img_path = str(feature_chunk.iloc[i][image_cols[0]])
+                            pil_img = PILImage.open(img_path).convert("RGB")
+                            if (self._apply_augmentation
+                                    and hasattr(self._image_preprocessor, "augment")):
+                                pil_img = self._image_preprocessor.augment(pil_img)
+                            sample["image"] = self._image_preprocessor(pil_img)
+                        except Exception:
+                            h, w = self._image_preprocessor.target_size
+                            sample["image"] = torch.zeros(
+                                3, h, w, dtype=torch.float32
+                            )
+
+                    yield sample
+
+                global_row_idx += len(chunk_df)
 
 
 class TrainingOrchestrator:
@@ -1073,7 +1439,7 @@ class TrainingOrchestrator:
             # worker to pickle the entire Subset + parent dataset on every
             # epoch boundary.  Disable to avoid OOM on large datasets.
             _persistent = _n_workers > 0 and _sys.platform != "win32"
-            _pin = self.device.type == "cuda" and _n_workers >= 0
+            _pin = self.device.type == "cuda" and _n_workers > 0
 
             train_loader = DataLoader(
                 train_ds, batch_size=batch_size, shuffle=True,
@@ -1098,28 +1464,95 @@ class TrainingOrchestrator:
             accelerator: str = "gpu" if self.device.type == "cuda" else "cpu"
             mlflow.set_experiment("apex_phase5")
 
-            # Instantiate frozen encoders ONCE – shared across all Optuna
-            # trials to avoid redundant ~540 MB loads per trial.
-            _image_encoder = None
-            _text_encoder = None
-            if self.fitted_transformers.get("image") is not None:
-                from modelss.encoders.image import ImageEncoder
-                _image_encoder = ImageEncoder(pretrained=True, freeze_backbone=True)
-                _image_encoder.eval()
-                for p in _image_encoder.parameters():
-                    p.requires_grad = False
-                _image_encoder.to(self.device)
-                logger.info("  Frozen ImageEncoder loaded on %s", self.device)
-            if self.fitted_transformers.get("text") is not None:
-                from modelss.encoders.text import TextEncoder
-                _text_encoder = TextEncoder(freeze_backbone=True)
-                _text_encoder.eval()
-                for p in _text_encoder.parameters():
-                    p.requires_grad = False
-                _text_encoder.to(self.device)
-                # Update dim from encoder config (handles bert-large etc.)
+            # Load user-registered encoder plugins before JIT selection
+            try:
+                import config.encoder_plugins  # noqa: F401
+            except ImportError:
+                pass
+
+            # Instantiate frozen encoders ONCE via JIT hardware profiler —
+            # selects the highest-capacity encoders that fit within the
+            # available VRAM budget (eta=0.85 safety margin).  Falls back to
+            # lightest encoders on CPU or when no combination fits.
+            from automl.jit_encoder_selector import JITEncoderSelector
+
+            _jit_selector = JITEncoderSelector(
+                safety_margin=0.85,
+                batch_size=batch_size,
+            )
+            _jit_result = _jit_selector.select(
+                modalities=schema_info.get("global_modalities", self.config.modalities),
+                device=self.device if self.device.type == "cuda" else None,
+            )
+
+            _image_encoder = _jit_result.image_encoder
+            _text_encoder = _jit_result.text_encoder
+
+            # Update input_dims from the selected encoder's actual output
+            if _text_encoder is not None and hasattr(_text_encoder, "get_output_dim"):
                 input_dims["text_pooled"] = _text_encoder.get_output_dim()
-                logger.info("  Frozen TextEncoder loaded on %s", self.device)
+
+            # Log selection results
+            logger.info(
+                "  JIT Encoder Selection: method=%s  "
+                "image=%s  text=%s  capacity=%s  peak=%.2f MB",
+                _jit_result.selection_method,
+                _jit_result.image_encoder_name or "—",
+                _jit_result.text_encoder_name or "—",
+                f"{_jit_result.total_capacity:,}",
+                _jit_result.total_peak_memory_bytes / 1e6,
+            )
+            for component, reason in _jit_result.rationale.items():
+                logger.info("    %s: %s", component, reason)
+
+            # Extract tabular encoder class from JIT result for per-trial
+            # instantiation.  Tabular encoders are trainable (not frozen),
+            # so we store only the class reference here and create fresh
+            # instances inside objective().
+            _tabular_encoder_class = _jit_result.tabular_encoder_class
+            _tabular_input_dim: Optional[int] = None
+            tabular_prep = self.fitted_transformers.get("tabular")
+            if tabular_prep is not None:
+                _tabular_input_dim = tabular_prep.get_output_dim()
+
+            # Update input_dims["tabular"] to encoder OUTPUT dim (not raw dim)
+            # so _MultimodalHead is sized to the encoded representation.
+            if _tabular_encoder_class is not None and "tabular" in input_dims:
+                input_dims["tabular"] = _jit_result.tabular_encoder_output_dim
+                logger.info(
+                    "  Tabular encoder: %s  raw_input_dim=%s  output_dim=%d",
+                    _jit_result.tabular_encoder_name,
+                    _tabular_input_dim,
+                    _jit_result.tabular_encoder_output_dim,
+                )
+
+            # ================================================================
+            # Pre-compute frozen encoder embeddings (one-time forward pass)
+            # ================================================================
+            # Text embeddings are deterministic (no augmentation) so we cache
+            # for both train and val splits.  Image embeddings are cached for
+            # val only because training images go through random augmentation.
+            if _text_encoder is not None and hasattr(_aug_ds, '_text_cols') and _aug_ds._text_cols:
+                logger.info("  Pre-computing text embeddings (%d samples)...", n_total)
+                _precomputed_text = _precompute_text_embeddings(
+                    _clean_ds, _text_encoder, self.device, batch_size=batch_size,
+                )
+                _aug_ds._precomputed_text = _precomputed_text
+                _clean_ds._precomputed_text = _precomputed_text
+                logger.info("  Text embeddings cached: shape=%s", list(_precomputed_text.shape))
+            else:
+                _precomputed_text = None
+
+            if _image_encoder is not None and hasattr(_clean_ds, '_image_cols') and _clean_ds._image_cols:
+                logger.info("  Pre-computing image embeddings for val (%d samples)...", n_total)
+                _precomputed_image_val = _precompute_image_embeddings(
+                    _clean_ds, _image_encoder, self.device, batch_size=batch_size,
+                )
+                # Train images: NOT cached (random augmentation must be preserved)
+                _aug_ds._precomputed_image = None
+                # Val images: cached (deterministic preprocessing only)
+                _clean_ds._precomputed_image = _precomputed_image_val
+                logger.info("  Image embeddings cached (val only): shape=%s", list(_precomputed_image_val.shape))
 
             def _sample(trial: optuna.Trial, key: str, default: Any) -> Any:
                 """Sample a value from hpo_space or return the default."""
@@ -1161,6 +1594,14 @@ class TrainingOrchestrator:
                     trial_dropout = _sample(trial, "dropout",       0.1)
                     trial_epochs  = _sample(trial, "epochs",        model_sel.get("epochs", 10))
 
+                # Create a FRESH tabular encoder for this trial (trainable,
+                # random init).  Image/text encoders are shared (frozen).
+                _trial_tabular_encoder = None
+                if _tabular_encoder_class is not None and _tabular_input_dim is not None:
+                    _trial_tabular_encoder = _tabular_encoder_class(
+                        input_dim=_tabular_input_dim,
+                    )
+
                 lightning_module = build_trainer(
                     problem_type=problem_type,
                     num_classes=num_classes,
@@ -1171,6 +1612,7 @@ class TrainingOrchestrator:
                     max_epochs=trial_epochs,
                     image_encoder=_image_encoder,
                     text_encoder=_text_encoder,
+                    tabular_encoder=_trial_tabular_encoder,
                     class_weights=_class_weights,
                 )
 
@@ -1343,6 +1785,17 @@ class TrainingOrchestrator:
                 # Scalar defaults from Phase 4 (kept for Phase 6 / registry)
                 "epochs":            model_sel.get("epochs", 10),
                 "learning_rate":     model_sel.get("learning_rate", 1e-3),
+                # JIT encoder selection metadata
+                "encoder_selection": {
+                    "method": _jit_result.selection_method,
+                    "image_encoder": _jit_result.image_encoder_name,
+                    "text_encoder": _jit_result.text_encoder_name,
+                    "tabular_encoder": _jit_result.tabular_encoder_name,
+                    "total_capacity": _jit_result.total_capacity,
+                    "peak_memory_mb": round(_jit_result.total_peak_memory_bytes / 1e6, 2),
+                    "vram_budget_mb": round(_jit_result.vram_budget_bytes / 1e6, 2),
+                    "rationale": _jit_result.rationale,
+                },
             }
 
             logger.info("\nPhase 5 Summary:")
@@ -1632,6 +2085,19 @@ class TrainingOrchestrator:
                     except Exception as exc:
                         logger.warning("  TextEncoder save FAILED: %s", exc)
 
+                # Save trained tabular encoder state dict
+                _tab_enc = getattr(
+                    self.best_lightning_module, "tabular_encoder", None
+                )
+                if _tab_enc is not None:
+                    tab_enc_path = artifacts_dir / "tabular_encoder_state.pth"
+                    try:
+                        torch.save(_tab_enc.state_dict(), tab_enc_path)
+                        artifact_paths["tabular_encoder_state"] = str(tab_enc_path)
+                        logger.info("  TabularEncoder saved: %s", tab_enc_path)
+                    except Exception as exc:
+                        logger.warning("  TabularEncoder save FAILED: %s", exc)
+
                 # Save encoder config so inference knows model names / settings
                 encoder_config: Dict[str, Any] = {}
                 if _txt_enc is not None:
@@ -1644,6 +2110,12 @@ class TrainingOrchestrator:
                     encoder_config["image_encoder"] = {
                         "pretrained": True,
                         "freeze_backbone": True,
+                    }
+                if _tab_enc is not None:
+                    encoder_config["tabular_encoder"] = {
+                        "type": type(_tab_enc).__name__,
+                        "input_dim": getattr(_tab_enc, "input_dim", None),
+                        "output_dim": _tab_enc.get_output_dim(),
                     }
                 if encoder_config:
                     enc_config_path = artifacts_dir / "encoder_config.json"
@@ -1782,9 +2254,13 @@ class TrainingOrchestrator:
             phase.name: result
             for phase, result in self.phase_results.items()
         }
+        # Safely extract model_id — may not exist if Phase 7 was skipped
+        model_id = "unknown"
+        if Phase.MODEL_REGISTRY in self.phase_results:
+            model_id = self.phase_results[Phase.MODEL_REGISTRY].get("model_id", "unknown")
         return {
             "status": "success",
-            "model_id": self.phase_results[Phase.MODEL_REGISTRY]["model_id"],
+            "model_id": model_id,
             "total_duration_seconds": total_elapsed,
             "phases": serializable_phases,
             "metadata": {

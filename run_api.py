@@ -1,6 +1,7 @@
 """APEX Framework API – production-grade FastAPI entrypoint."""
 
 import asyncio
+import json
 import collections
 import logging
 import sys
@@ -10,7 +11,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -18,6 +19,15 @@ import uvicorn
 import pandas as pd
 import torch
 import os
+import re as _re
+
+from task_store import task_db, IngestionProgressTracker, TrainingProgressTracker
+
+# Load user-registered encoder plugins (safe import -- file may be empty)
+try:
+    import config.encoder_plugins  # noqa: F401
+except ImportError:
+    pass
 
 # ---------------------------------------------------------------------------
 # Path setup
@@ -38,7 +48,7 @@ app = FastAPI(title="APEX Framework API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -49,6 +59,21 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 GPU_AVAILABLE: bool = torch.cuda.is_available()
 GPU_DEVICE: str = torch.cuda.get_device_name(0) if GPU_AVAILABLE else "CPU"
+
+# ---------------------------------------------------------------------------
+# Input sanitization
+# ---------------------------------------------------------------------------
+_SAFE_MODEL_ID = _re.compile(r"^[\w\-.:]+$")
+
+
+def _sanitize_model_id(model_id: str) -> str:
+    """Validate model_id to prevent directory traversal attacks."""
+    if not _SAFE_MODEL_ID.match(model_id) or ".." in model_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid model_id: contains disallowed characters.",
+        )
+    return model_id
 
 # ---------------------------------------------------------------------------
 # Pydantic models – defined BEFORE any endpoint that references them
@@ -91,170 +116,10 @@ _MAX_ENGINES: int = 5
 _engine_cache: collections.OrderedDict[str, Any] = collections.OrderedDict()
 _engine_cache_lock = threading.Lock()
 
-# ---------------------------------------------------------------------------
-# Async inference task store – eliminates 504 timeouts on large batches.
-# Thread-safe dict: task_id -> {status, result, error, created_at}
-# ---------------------------------------------------------------------------
-_TASK_STORE: Dict[str, Dict[str, Any]] = {}
-_task_store_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# Training task progress tracking (background task + polling)
-# ---------------------------------------------------------------------------
-
-_training_tasks: Dict[str, Dict[str, Any]] = {}
-_training_tasks_lock = threading.Lock()
-
-# ---------------------------------------------------------------------------
-# Ingestion task progress tracking (background task + polling)
-# ---------------------------------------------------------------------------
-
-_ingestion_tasks: Dict[str, Dict[str, Any]] = {}
-_ingestion_tasks_lock = threading.Lock()
 
 
-class IngestionProgressTracker:
-    """Thread-safe progress tracker for a single ingestion task."""
-
-    def __init__(self, task_id: str, sources: List[str]) -> None:
-        self.task_id = task_id
-        with _ingestion_tasks_lock:
-            _ingestion_tasks[task_id] = {
-                "task_id": task_id,
-                "status": "running",
-                "progress_pct": 0,
-                "message": "Starting ingestion...",
-                "total_sources": len(sources),
-                "completed_sources": 0,
-                "datasets": [],  # per-dataset results
-                "result": None,
-                "error": None,
-            }
-
-    def _state(self) -> Dict[str, Any]:
-        return _ingestion_tasks[self.task_id]
-
-    def set_progress(self, pct: int, message: str) -> None:
-        with _ingestion_tasks_lock:
-            state = self._state()
-            state["progress_pct"] = pct
-            state["message"] = message
-
-    def report_dataset(self, dataset_info: Dict[str, Any]) -> None:
-        """Report a single dataset's result (success or failure)."""
-        with _ingestion_tasks_lock:
-            state = self._state()
-            state["datasets"].append(dataset_info)
-            state["completed_sources"] = len(state["datasets"])
-            done = state["completed_sources"]
-            total = state["total_sources"]
-            state["progress_pct"] = int((done / max(total, 1)) * 90) + 5
-
-    def complete(self, result: Dict[str, Any]) -> None:
-        with _ingestion_tasks_lock:
-            state = self._state()
-            state["status"] = "completed"
-            state["progress_pct"] = 100
-            state["message"] = "Ingestion complete"
-            state["result"] = result
-
-    def fail(self, error: str) -> None:
-        with _ingestion_tasks_lock:
-            state = self._state()
-            state["status"] = "failed"
-            state["error"] = error
-            state["message"] = f"Failed: {error}"
 
 
-class TrainingProgressTracker:
-    """Thread-safe progress tracker for a single training task."""
-
-    def __init__(self, task_id: str) -> None:
-        self.task_id = task_id
-        with _training_tasks_lock:
-            _training_tasks[task_id] = {
-                "task_id": task_id,
-                "status": "running",
-                "current_phase": 0,
-                "current_phase_name": "Initializing",
-                "progress_pct": 0,
-                "messages": [],
-                "epoch_metrics": [],     # per-epoch structured metrics
-                "trial_progress": None,  # {"current": 1, "total": 3, ...}
-                "data_split": None,      # {"train": 8000, "val": 2000}
-                "result": None,
-                "error": None,
-            }
-
-    def _state(self) -> Dict[str, Any]:
-        return _training_tasks[self.task_id]
-
-    def set_phase(self, phase_num: int, phase_name: str, progress_pct: int) -> None:
-        with _training_tasks_lock:
-            state = self._state()
-            state["current_phase"] = phase_num
-            state["current_phase_name"] = phase_name
-            state["progress_pct"] = progress_pct
-
-    def add_message(self, phase: int, msg_type: str, text: str) -> None:
-        with _training_tasks_lock:
-            self._state()["messages"].append({
-                "phase": phase,
-                "type": msg_type,
-                "text": text,
-                "timestamp": datetime.now().isoformat(),
-            })
-
-    def log_epoch(self, trial: int, epoch: int, max_epoch: int,
-                  train_loss: float, val_loss: float,
-                  train_acc: float = 0.0, val_acc: float = 0.0,
-                  train_f1: float = 0.0, val_f1: float = 0.0) -> None:
-        """Push structured per-epoch metrics for live rendering."""
-        with _training_tasks_lock:
-            state = self._state()
-            state["epoch_metrics"].append({
-                "trial": trial,
-                "epoch": epoch,
-                "max_epoch": max_epoch,
-                "train_loss": round(train_loss, 5),
-                "val_loss": round(val_loss, 5),
-                "train_acc": round(train_acc, 4),
-                "val_acc": round(val_acc, 4),
-                "train_f1": round(train_f1, 4),
-                "val_f1": round(val_f1, 4),
-                "timestamp": datetime.now().isoformat(),
-            })
-            # Update progress within Phase 5 (55-95% range)
-            total_epochs = max_epoch * (state.get("trial_progress", {}) or {}).get("total", 1)
-            done_epochs = (trial * max_epoch) + epoch
-            pct = 55 + int(40 * done_epochs / max(total_epochs, 1))
-            state["progress_pct"] = min(pct, 95)
-
-    def set_trial(self, current: int, total: int) -> None:
-        """Update which Optuna trial is running."""
-        with _training_tasks_lock:
-            state = self._state()
-            state["trial_progress"] = {"current": current, "total": total}
-
-    def set_data_split(self, train: int, val: int, total: int) -> None:
-        """Record train/val split sizes."""
-        with _training_tasks_lock:
-            state = self._state()
-            state["data_split"] = {"train": train, "val": val, "total": total}
-
-    def complete(self, result: Dict[str, Any]) -> None:
-        with _training_tasks_lock:
-            state = self._state()
-            state["status"] = "completed"
-            state["progress_pct"] = 100
-            state["current_phase_name"] = "Complete"
-            state["result"] = result
-
-    def fail(self, error: str) -> None:
-        with _training_tasks_lock:
-            state = self._state()
-            state["status"] = "failed"
-            state["error"] = error
 
 # ---------------------------------------------------------------------------
 # Basic routes
@@ -380,7 +245,7 @@ async def ingest_datasets_endpoint(
     logger.info("[%s] Ingestion request for %d dataset(s)", session_id, len(dataset_urls))
 
     task_id = uuid.uuid4().hex[:8]
-    tracker = IngestionProgressTracker(task_id, dataset_urls)
+    tracker = IngestionProgressTracker(task_id, dataset_urls, task_db)
 
     # Per-session isolation: each session_id gets its own dict.
     with _session_lock:
@@ -473,8 +338,8 @@ async def ingest_datasets_endpoint(
                     })
 
             # Build final result in the old response format for compatibility
-            with _ingestion_tasks_lock:
-                datasets_info = _ingestion_tasks[task_id]["datasets"]
+            _payload = task_db.get_payload(task_id)
+            datasets_info = _payload.get("datasets", [])
 
             success_count = sum(1 for d in datasets_info if d["status"] == "success")
             failed_count = len(datasets_info) - success_count
@@ -521,15 +386,24 @@ async def ingest_datasets_endpoint(
 @app.get("/ingest/status/{task_id}")
 async def ingest_status(task_id: str) -> Dict[str, Any]:
     """Poll ingestion progress for a given task_id."""
-    with _ingestion_tasks_lock:
-        task = _ingestion_tasks.get(task_id)
+    task = task_db.get_task(task_id)
     if task is None:
         raise HTTPException(
             status_code=404,
             detail=f"Unknown ingestion task_id: {task_id}",
         )
-    import copy
-    return copy.deepcopy(task)
+    payload = task.get("payload", {})
+    return {
+        "task_id":            task["task_id"],
+        "status":             task["status"],
+        "progress_pct":       payload.get("progress_pct", 0),
+        "message":            payload.get("message", ""),
+        "total_sources":      payload.get("total_sources", 0),
+        "completed_sources":  payload.get("completed_sources", 0),
+        "datasets":           payload.get("datasets", []),
+        "result":             task.get("result"),
+        "error":              task.get("error"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -570,20 +444,22 @@ async def detect_schema(request: Request) -> Dict[str, Any]:
         from data_ingestion.schema_detector import MultiDatasetSchemaDetector
 
         # STRICT SESSION ISOLATION: reject if no active session
-        if not session_ingested_hashes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "No active ingestion session. "
-                    "Call POST /ingest/datasets first to register datasets."
-                ),
-            )
+        with _session_lock:
+            if not session_ingested_hashes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No active ingestion session. "
+                        "Call POST /ingest/datasets first to register datasets."
+                    ),
+                )
+            _snapshot_hashes = list(session_ingested_hashes.keys())
 
         cache_dir = Path("./data/dataset_cache")
         loader = DataLoader()
         lazy_datasets: Dict[str, Any] = {}
 
-        for hash_id in session_ingested_hashes:
+        for hash_id in _snapshot_hashes:
             cache_path = cache_dir / hash_id
             lazy_ref = loader.load_cached(cache_path)
             if lazy_ref is not None:
@@ -664,14 +540,16 @@ async def preprocess_data(request: Request) -> Dict[str, Any]:
         from preprocessing.text_preprocessor import TextPreprocessor
         from preprocessing.tabular_preprocessor import TabularPreprocessor
 
-        if not session_ingested_hashes:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "No active ingestion session. "
-                    "Call POST /ingest/datasets first to register datasets."
-                ),
-            )
+        with _session_lock:
+            if not session_ingested_hashes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "No active ingestion session. "
+                        "Call POST /ingest/datasets first to register datasets."
+                    ),
+                )
+            _snapshot_hashes_pp = list(session_ingested_hashes.keys())
 
         # ----------------------------------------------------------------
         # Load cached lazy refs for current session
@@ -679,7 +557,7 @@ async def preprocess_data(request: Request) -> Dict[str, Any]:
         cache_dir = Path("./data/dataset_cache")
         loader = DataLoader()
         lazy_datasets: Dict[str, Any] = {}
-        for hash_id in session_ingested_hashes:
+        for hash_id in _snapshot_hashes_pp:
             cache_path = cache_dir / hash_id
             lazy_ref = loader.load_cached(cache_path)
             if lazy_ref is not None:
@@ -976,7 +854,7 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
         ]
 
         task_id = uuid.uuid4().hex[:8]
-        tracker = TrainingProgressTracker(task_id)
+        tracker = TrainingProgressTracker(task_id, task_db)
 
         logger.info(
             "/train-pipeline: task=%s  problem=%s  modalities=%s  sources=%d  hp_overrides=%s",
@@ -1169,16 +1047,26 @@ async def train_pipeline(request: Request) -> Dict[str, Any]:
 @app.get("/train-pipeline/status/{task_id}")
 async def train_pipeline_status(task_id: str) -> Dict[str, Any]:
     """Poll training progress for a given task_id."""
-    with _training_tasks_lock:
-        task = _training_tasks.get(task_id)
+    task = task_db.get_task(task_id)
     if task is None:
         raise HTTPException(
             status_code=404,
             detail=f"Unknown task_id: {task_id}",
         )
-    # Return a snapshot copy to avoid race on mutable contents
-    import copy
-    return copy.deepcopy(task)
+    payload = task.get("payload", {})
+    return {
+        "task_id":            task["task_id"],
+        "status":             task["status"],
+        "current_phase":      payload.get("current_phase", 0),
+        "current_phase_name": payload.get("current_phase_name", "Initializing"),
+        "progress_pct":       payload.get("progress_pct", 0),
+        "messages":           payload.get("messages", []),
+        "epoch_metrics":      payload.get("epoch_metrics", []),
+        "trial_progress":     payload.get("trial_progress"),
+        "data_split":         payload.get("data_split"),
+        "result":             task.get("result"),
+        "error":              task.get("error"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1247,6 +1135,8 @@ async def monitor_drift(request: Request) -> Dict[str, Any]:
         problem_type: str = body.get("problem_type", "classification_binary")
         modalities: List[str] = body.get("modalities", ["tabular"])
         model_id: Optional[str] = body.get("model_id")
+        if model_id:
+            model_id = _sanitize_model_id(model_id)
 
         sources: List[str] = [
             meta.get("source_url", hid)
@@ -1425,6 +1315,7 @@ async def model_info(model_id: str) -> Dict[str, Any]:
     """Return class labels and expected feature columns for a registered model."""
     import json as _json
 
+    model_id = _sanitize_model_id(model_id)
     registry_root = Path("models") / "registry" / model_id
     if not registry_root.exists():
         raise HTTPException(status_code=404, detail=f"Model '{model_id}' not found.")
@@ -1512,14 +1403,13 @@ def _run_inference_task(
     Background worker that wraps the existing synchronous inference path.
 
     Runs in a thread spawned by FastAPI BackgroundTasks.  Updates
-    ``_TASK_STORE[task_id]`` with PROCESSING → COMPLETED | FAILED so the
+    the SQLite task store with PROCESSING -> COMPLETED | FAILED so the
     frontend can poll ``GET /task/{task_id}`` without blocking.
     """
-    with _task_store_lock:
-        _TASK_STORE[task_id]["status"] = "PROCESSING"
+    task_db.update_status(task_id, "PROCESSING")
 
     try:
-        from pipeline.inference_enginee import MultimodalInferenceEngine
+        from pipeline.inference_engine import MultimodalInferenceEngine
 
         # Re-use cached engine (same LRU logic as /predict)
         with _engine_cache_lock:
@@ -1575,15 +1465,11 @@ def _run_inference_task(
             "explanations": explanations,
         }
 
-        with _task_store_lock:
-            _TASK_STORE[task_id]["status"] = "COMPLETED"
-            _TASK_STORE[task_id]["result"] = payload
+        task_db.update_result(task_id, "COMPLETED", payload)
 
     except Exception as exc:
         logger.error("Background inference task %s failed: %s", task_id, exc, exc_info=True)
-        with _task_store_lock:
-            _TASK_STORE[task_id]["status"] = "FAILED"
-            _TASK_STORE[task_id]["error"] = str(exc)
+        task_db.update_error(task_id, "FAILED", str(exc))
 
 
 @app.post("/predict-async")
@@ -1600,6 +1486,7 @@ async def predict_async(request: Request, background_tasks: BackgroundTasks) -> 
     model_id: Optional[str] = body.get("model_id")
     if not model_id:
         raise HTTPException(status_code=400, detail="model_id is required.")
+    model_id = _sanitize_model_id(model_id)
 
     raw_inputs: List[Dict[str, Any]] = body.get("inputs", [])
     if not raw_inputs:
@@ -1616,15 +1503,12 @@ async def predict_async(request: Request, background_tasks: BackgroundTasks) -> 
     n_steps: int      = int(body.get("n_steps", 50))
 
     task_id: str = str(uuid.uuid4())
-    with _task_store_lock:
-        _TASK_STORE[task_id] = {
-            "status":     "PENDING",
-            "result":     None,
-            "error":      None,
-            "created_at": datetime.now().isoformat(),
-            "model_id":   model_id,
-            "n_samples":  len(raw_inputs),
-        }
+    task_db.insert_task(
+        task_id=task_id,
+        task_type="inference",
+        status="PENDING",
+        payload={"model_id": model_id, "n_samples": len(raw_inputs)},
+    )
 
     background_tasks.add_task(
         _run_inference_task,
@@ -1642,8 +1526,7 @@ async def get_task_status(task_id: str) -> Dict[str, Any]:
     Returns the full prediction payload once COMPLETED, or an error
     message if FAILED.
     """
-    with _task_store_lock:
-        task = _TASK_STORE.get(task_id)
+    task = task_db.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
 
@@ -1660,7 +1543,193 @@ async def get_task_status(task_id: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Inference  (synchronous – kept for backward compat, small batches)
+# WebSocket streaming inference
+# ---------------------------------------------------------------------------
+
+@app.websocket("/ws/predict")
+async def ws_predict(websocket: WebSocket) -> None:
+    """
+    WebSocket inference endpoint with real-time status streaming.
+
+    Protocol
+    --------
+    1. Client connects, server sends ``{"type": "status", "status": "CONNECTED"}``.
+    2. Client sends a JSON message with ``model_id``, ``inputs``, etc.
+    3. Server streams status updates as processing progresses.
+    4. Server sends ``{"type": "complete", "result": {...}}`` with the
+       full prediction payload.
+    5. On error: ``{"type": "error", "error": "..."}``.
+    6. Connection closes after the result is sent.
+    """
+    await websocket.accept()
+
+    try:
+        # 1. Acknowledge connection
+        await websocket.send_json({"type": "status", "status": "CONNECTED"})
+
+        # 2. Receive the inference request
+        raw_message = await websocket.receive_text()
+        body: Dict[str, Any] = json.loads(raw_message)
+
+        model_id: Optional[str] = body.get("model_id")
+        if not model_id:
+            await websocket.send_json({"type": "error", "error": "model_id is required."})
+            return
+
+        raw_inputs: List[Dict[str, Any]] = body.get("inputs", [])
+        if not raw_inputs:
+            await websocket.send_json({"type": "error", "error": "inputs list is empty."})
+            return
+
+        _MAX_BATCH: int = 10_000
+        if len(raw_inputs) > _MAX_BATCH:
+            await websocket.send_json({
+                "type": "error",
+                "error": f"Batch too large ({len(raw_inputs)} rows). Maximum is {_MAX_BATCH}.",
+            })
+            return
+
+        explain: bool = bool(body.get("explain", False))
+        target_class: int = int(body.get("target_class", -1))
+        n_steps: int = int(body.get("n_steps", 50))
+
+        # 3. Load or retrieve inference engine
+        await websocket.send_json({"type": "status", "status": "LOADING_MODEL"})
+
+        from pipeline.inference_engine import MultimodalInferenceEngine
+
+        with _engine_cache_lock:
+            if model_id in _engine_cache:
+                _engine_cache.move_to_end(model_id)
+                engine = _engine_cache[model_id]
+            else:
+                engine = None
+
+        if engine is None:
+            engine = await asyncio.to_thread(
+                MultimodalInferenceEngine, model_id=model_id,
+            )
+            with _engine_cache_lock:
+                _engine_cache[model_id] = engine
+                while len(_engine_cache) > _MAX_ENGINES:
+                    _engine_cache.popitem(last=False)
+
+        # 4. Run inference — chunk large batches for progress streaming
+        await websocket.send_json({
+            "type": "status",
+            "status": "PROCESSING",
+            "n_samples": len(raw_inputs),
+        })
+
+        CHUNK_SIZE: int = 100
+        df_full: pd.DataFrame = pd.DataFrame(raw_inputs)
+
+        if len(raw_inputs) <= CHUNK_SIZE:
+            result = await asyncio.to_thread(engine.predict_batch, df_full)
+        else:
+            all_predictions: List[Any] = []
+            all_confidences: List[Any] = []
+            n_chunks = (len(raw_inputs) + CHUNK_SIZE - 1) // CHUNK_SIZE
+            problem_type = ""
+
+            for chunk_idx in range(n_chunks):
+                start = chunk_idx * CHUNK_SIZE
+                end = min(start + CHUNK_SIZE, len(raw_inputs))
+                chunk_df = df_full.iloc[start:end]
+
+                chunk_result = await asyncio.to_thread(engine.predict_batch, chunk_df)
+                all_predictions.extend(chunk_result["predictions"])
+                all_confidences.extend(chunk_result["confidences"])
+                problem_type = chunk_result["problem_type"]
+
+                await websocket.send_json({
+                    "type": "progress",
+                    "chunk": chunk_idx + 1,
+                    "total_chunks": n_chunks,
+                    "samples_completed": end,
+                    "samples_total": len(raw_inputs),
+                })
+
+            result = {
+                "predictions": all_predictions,
+                "confidences": all_confidences,
+                "problem_type": problem_type,
+                "n_samples": len(all_predictions),
+            }
+
+        # 5. Optional XAI explanations
+        explanations: Optional[Dict[str, Any]] = None
+        if explain:
+            await websocket.send_json({
+                "type": "status",
+                "status": "GENERATING_EXPLANATIONS",
+            })
+
+            effective_target: int = target_class
+            if target_class < 0:
+                preds = result.get("predictions", [])
+                confs = result.get("confidences", [])
+                if preds:
+                    first_pred = preds[0]
+                    if isinstance(first_pred, int):
+                        effective_target = first_pred
+                    elif isinstance(first_pred, list) and confs:
+                        first_conf = (
+                            confs[0] if isinstance(confs[0], list) else confs
+                        )
+                        effective_target = int(
+                            max(range(len(first_conf)), key=lambda i: first_conf[i])
+                        )
+                    else:
+                        effective_target = 0
+                else:
+                    effective_target = 0
+
+            explanations = await asyncio.to_thread(
+                engine.generate_explanations,
+                df_full,
+                target_class=effective_target,
+                n_steps=n_steps,
+            )
+
+        # 6. Send complete result
+        payload = {
+            "status": "success",
+            "predictions": result["predictions"],
+            "confidences": result["confidences"],
+            "problem_type": result["problem_type"],
+            "n_samples": result["n_samples"],
+            "explanations": explanations,
+        }
+        await websocket.send_json({"type": "complete", "result": payload})
+
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected during inference")
+    except json.JSONDecodeError as e:
+        try:
+            await websocket.send_json({"type": "error", "error": f"Invalid JSON: {e}"})
+        except Exception:
+            pass
+    except FileNotFoundError as fnf:
+        try:
+            await websocket.send_json({"type": "error", "error": str(fnf)})
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.error("WebSocket /ws/predict error: %s", exc, exc_info=True)
+        try:
+            await websocket.send_json({"type": "error", "error": str(exc)})
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Inference  (synchronous -- kept for backward compat, small batches)
 # ---------------------------------------------------------------------------
 
 @app.post("/predict")
@@ -1734,7 +1803,7 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
         target_class: int  = int(body.get("target_class", -1))
         n_steps: int        = int(body.get("n_steps", 50))
 
-        from pipeline.inference_enginee import MultimodalInferenceEngine
+        from pipeline.inference_engine import MultimodalInferenceEngine
 
         # Re-use cached engine with LRU eviction (thread-safe)
         with _engine_cache_lock:

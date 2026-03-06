@@ -85,7 +85,7 @@ class TabularPreprocessor:
         if len(sample) == 0:
             return False
         try:
-            parsed = pd.to_datetime(sample, errors="coerce", infer_datetime_format=True)
+            parsed = pd.to_datetime(sample, errors="coerce", format="mixed")
             return parsed.notna().mean() > 0.7
         except Exception:
             return False

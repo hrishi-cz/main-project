@@ -162,11 +162,11 @@ class MultimodalPredictor(nn.Module):
         )
 
         # ── Predictor head ────────────────────────────────────────────────
-        # classification : Linear(128, num_classes) → Softmax(dim=1)
+        # classification : Linear(128, num_classes) — raw logits (no activation)
         # regression     : Linear(128, 1)           → Identity()
         if problem_type.startswith("classification"):
             output_dim: int        = num_classes
-            activation: nn.Module  = nn.Softmax(dim=1)
+            activation: nn.Module  = nn.Identity()
         else:
             output_dim  = 1
             activation  = nn.Identity()

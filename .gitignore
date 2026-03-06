@@ -1,51 +1,48 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
+*.pyo
 *.egg-info/
 dist/
 build/
-.env
-.venv
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
 
 # IDE
 .vscode/
 .idea/
 *.swp
 *.swo
-*~
 
-# Data
-data/dataset_cache/
-*.csv
-*.pkl
-*.parquet
-
-# Model files
-*.h5
-*.pkl
-models/
-
-# OS
-.DS_Store
-Thumbs.db
+# Runtime databases
+tasks.db
+tasks.db-wal
+tasks.db-shm
 
 # Logs
+logs/
+api/logs/
 *.log
 
-# Cache
-.cache/
-.pytest_cache/
+# Data / cache (user-generated at runtime)
+data/
+cache/
+models/
 
-# Temp files
-tmpclaude-*/
-tmpclaude-*-cwd
+# OS files
+.DS_Store
+Thumbs.db
 nul
 
-# Documentation (auto-generated, not source of truth)
-*.md
-!README.md
+# Temp files from claude sessions
+tmpclaude-*-cwd
+
+# Saved model artifacts
+*.pt
+*.pth
+*.ckpt
+*.pkl

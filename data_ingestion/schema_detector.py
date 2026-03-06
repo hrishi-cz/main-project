@@ -413,8 +413,10 @@ class MultiDatasetSchemaDetector:
                 if nunique > 20 and unique_ratio > 0.05:
                     score += 0.25
 
-            # Penalty for ID columns
-            if "id" in name:
+            # Penalty for ID columns — use word-boundary check to avoid
+            # false positives on words containing "id" (humidity, valid, rapid)
+            import re as _re_sd
+            if _re_sd.search(r'(?:^|_)id(?:$|_)', name):
                 score -= 0.45
 
             if score > best_score:

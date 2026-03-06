@@ -69,8 +69,17 @@ class TextPreprocessor:
         The ``.squeeze(0)`` call converts the tokeniser's ``[1, 128]``
         output to ``[128]`` so DataLoader can stack a batch to ``[B, 128]``.
         """
+        # Sanitize NaN/None inputs — tokenizing "nan"/"None" as words produces
+        # misleading embeddings.  Replace with empty string instead.
+        if text is None:
+            text = ""
+        else:
+            text = str(text)
+            if text.lower() in ("nan", "none", "null", "<na>"):
+                text = ""
+
         encoding = self.tokenizer(
-            str(text),
+            text,
             max_length=self._MAX_LENGTH,
             padding="max_length",
             truncation=True,

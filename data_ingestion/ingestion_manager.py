@@ -397,6 +397,13 @@ class DataIngestionManager:
                 )
             for zf in zip_files:
                 with zipfile.ZipFile(zf, "r") as zref:
+                    # ZipSlip protection: reject members that escape temp_dir
+                    for member in zref.namelist():
+                        member_path = (temp_dir / member).resolve()
+                        if not str(member_path).startswith(str(temp_dir.resolve())):
+                            raise ValueError(
+                                f"ZipSlip detected: '{member}' escapes target directory"
+                            )
                     zref.extractall(temp_dir)
                 zf.unlink()
 

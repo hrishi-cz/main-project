@@ -1184,23 +1184,25 @@ def _render_training_phases(
     current_phase: int,
     task_status: str,
 ) -> None:
-    """Render 5 phase expanders with their messages."""
+    """Render 7 phase expanders with their messages."""
     phase_names = {
         1: "Data Ingestion",
         2: "Schema Detection",
         3: "Preprocessing",
         4: "Model Selection",
         5: "Training",
+        6: "Drift Detection",
+        7: "Model Registry",
     }
 
     # Group messages by phase
-    phase_msgs: Dict[int, List[Dict]] = {i: [] for i in range(1, 6)}
+    phase_msgs: Dict[int, List[Dict]] = {i: [] for i in range(1, 8)}
     for msg in messages:
         p = msg.get("phase", 0)
-        if 1 <= p <= 5:
+        if 1 <= p <= 7:
             phase_msgs[p].append(msg)
 
-    for phase_num in range(1, 6):
+    for phase_num in range(1, 8):
         name = phase_names[phase_num]
 
         if phase_num < current_phase:
@@ -1218,8 +1220,8 @@ def _render_training_phases(
                 if not is_done:
                     st.caption("In progress...")
         else:
-            # Future phase
-            with st.status(f"Phase {phase_num}: {name}", state="error", expanded=False):
+            # Future phase — use "running" state (neutral) rather than "error" (red)
+            with st.status(f"Phase {phase_num}: {name}", state="running", expanded=False):
                 st.caption("Pending")
 
 
@@ -1792,10 +1794,15 @@ def _render_token_html(tokens: List[str], attributions: List[float]) -> str:
         if not display_token:
             continue
 
+        # HTML-escape token text to prevent XSS
+        import html as _html
+        safe_token = _html.escape(display_token)
+        safe_attr = f"{attr:.4f}"
+
         parts.append(
             f'<span style="background-color:rgb({r},{g},{b});padding:2px 4px;'
             f'border-radius:3px;margin:1px;display:inline-block;" '
-            f'title="attribution: {attr:.4f}">{display_token}</span>'
+            f'title="attribution: {safe_attr}">{safe_token}</span>'
         )
 
     return (

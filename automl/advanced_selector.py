@@ -82,21 +82,20 @@ class SelectionResult:
 # ---------------------------------------------------------------------------
 
 IMAGE_ENCODERS: Dict[str, Dict[str, Any]] = {
-    "lightweight": {"name": "MobileNetV3",    "output_dim": 1280, "params": "2.2M"},
-    "balanced":    {"name": "ResNet50",        "output_dim": 2048, "params": "25M"},
-    "sota":        {"name": "ViT-Base",        "output_dim": 768,  "params": "86M"},
+    "lightweight": {"name": "MobileNetV3",    "output_dim": 512,  "params": "2.5M"},
+    "balanced":    {"name": "ResNet50",        "output_dim": 512,  "params": "25M"},
+    "sota":        {"name": "ConvNeXt-Tiny",   "output_dim": 512,  "params": "28.6M"},
 }
 
 TEXT_ENCODERS: Dict[str, Dict[str, Any]] = {
-    "fast":     {"name": "DistilBERT",    "output_dim": 768,  "params": "66M"},
-    "balanced": {"name": "BERT-base",     "output_dim": 768,  "params": "110M"},
-    "sota":     {"name": "RoBERTa-large", "output_dim": 1024, "params": "355M"},
+    "fast":     {"name": "MiniLM-L6-v2", "output_dim": 768,  "params": "22.7M"},
+    "balanced": {"name": "BERT-base",    "output_dim": 768,  "params": "110M"},
+    "sota":     {"name": "DeBERTa-v3",   "output_dim": 768,  "params": "183.8M"},
 }
 
 TABULAR_ENCODERS: Dict[str, Dict[str, Any]] = {
-    "simple":       {"name": "MLP",           "output_dim": 128},
-    "interpretable":{"name": "TabNet",         "output_dim": 128},
-    "sota":         {"name": "FT-Transformer", "output_dim": 256},
+    "simple":       {"name": "MLP",  "output_dim": 16},
+    "interpretable":{"name": "GRN",  "output_dim": 16},
 }
 
 

@@ -34,6 +34,12 @@ class ImagePreprocessor:
                 std=[0.229, 0.224, 0.225],
             ),
         ])
+        # Pre-build augmentation pipeline once (avoid re-creating on every call)
+        self._augment_transforms = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomRotation(10),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2),
+        ])
 
     # ------------------------------------------------------------------
     # Core API
@@ -56,12 +62,7 @@ class ImagePreprocessor:
 
     def augment(self, image: Image.Image) -> Image.Image:
         """Apply data augmentation (training only – returns PIL Image)."""
-        augment_transforms = transforms.Compose([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomRotation(10),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2),
-        ])
-        return augment_transforms(image)
+        return self._augment_transforms(image)
 
     # ------------------------------------------------------------------
     # Config helper (used by /preprocess API endpoint)

@@ -7,7 +7,7 @@ from .modelss import MultimodalPredictor
 
 def create_app():
     """Factory function to create FastAPI application."""
-    from .api.main_enhanced import app
+    from .run_api import app
     return app
 
 __all__ = ["create_app", "MultimodalPredictor"]
