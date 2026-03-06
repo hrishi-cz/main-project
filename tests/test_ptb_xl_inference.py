@@ -11,8 +11,10 @@ from inference.ptb_xl_inference import (
     _build_ptbxl_metadata,
     _build_ptbxl_ecg_image,
     build_trial_inputs,
+    collect_manual_input,
     _TabularStubPredictor,
     InferenceVerificationResult,
+    FEATURE_COLUMNS,
 )
 from data_ingestion.adapters.ecg_adapter import ECGAdapter
 from data_ingestion.schema_detector import MultiDatasetSchemaDetector
@@ -308,3 +310,77 @@ class TestPrintReport:
         report = result.print_report()
         assert "checks passed" in report
         assert "Relatedness score" in report
+
+
+# ---------------------------------------------------------------------------
+# Manual input collection tests
+# ---------------------------------------------------------------------------
+
+
+class TestManualInput:
+    """Verify interactive input collection via collect_manual_input."""
+
+    def test_collects_all_features(self):
+        """Simulated user types valid values for every feature."""
+        responses = iter(["55", "1", "175.5", "80.0"])
+        result = collect_manual_input(_input_fn=lambda _prompt: next(responses))
+        assert result == {"age": 55, "sex": 1, "height": 175.5, "weight": 80.0}
+
+    def test_custom_feature_cols(self):
+        """Only the requested columns are prompted."""
+        responses = iter(["30", "0"])
+        result = collect_manual_input(
+            ["age", "sex"], _input_fn=lambda _prompt: next(responses),
+        )
+        assert list(result.keys()) == ["age", "sex"]
+        assert result["age"] == 30
+        assert result["sex"] == 0
+
+    def test_retries_on_empty_input(self):
+        """Empty input is rejected and the prompt repeats."""
+        call_count = [0]
+
+        def _fake_input(_prompt):
+            call_count[0] += 1
+            # First call returns empty, second returns a valid value
+            if call_count[0] == 1:
+                return ""
+            return "42"
+
+        result = collect_manual_input(["age"], _input_fn=_fake_input)
+        assert result["age"] == 42
+        assert call_count[0] == 2
+
+    def test_retries_on_non_numeric_input(self):
+        """Non-numeric input is rejected and the prompt repeats."""
+        responses = iter(["abc", "65"])
+        result = collect_manual_input(
+            ["age"], _input_fn=lambda _prompt: next(responses),
+        )
+        assert result["age"] == 65
+
+    def test_integer_columns_stay_int(self):
+        """Age and sex should be returned as int, not float."""
+        responses = iter(["45", "0", "170", "75"])
+        result = collect_manual_input(_input_fn=lambda _prompt: next(responses))
+        assert isinstance(result["age"], int)
+        assert isinstance(result["sex"], int)
+
+    def test_float_columns_stay_float(self):
+        """Height and weight with decimals should be float."""
+        responses = iter(["45", "1", "170.5", "82.3"])
+        result = collect_manual_input(_input_fn=lambda _prompt: next(responses))
+        assert isinstance(result["height"], float)
+        assert isinstance(result["weight"], float)
+
+    def test_manual_input_runs_prediction(self):
+        """Manual input fed to run_trial_prediction produces valid output."""
+        responses = iter(["55", "1", "175.5", "80.0"])
+        manual = collect_manual_input(_input_fn=lambda _prompt: next(responses))
+
+        verifier = PTBXLInferenceVerifier(n_samples=50, n_trial=1)
+        df = _build_ptbxl_metadata(50)
+        pred = verifier.run_trial_prediction(df, [manual])
+        assert pred["n_samples"] == 1
+        assert len(pred["predictions"]) == 1
+        assert 0 <= pred["confidences"][0] <= 1.0

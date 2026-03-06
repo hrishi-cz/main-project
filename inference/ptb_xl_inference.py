@@ -159,6 +159,86 @@ def build_trial_inputs(n: int = 5) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------------------------
+# Interactive manual input collection
+# ---------------------------------------------------------------------------
+
+# The feature columns the stub predictor uses for inference.
+FEATURE_COLUMNS = ["age", "sex", "height", "weight"]
+
+# Human-readable hints shown next to each prompt so the user knows what to
+# type.  Keys must match ``FEATURE_COLUMNS``.
+_FEATURE_HINTS: Dict[str, str] = {
+    "age":    "patient age in years, e.g. 55",
+    "sex":    "0 = female, 1 = male",
+    "height": "height in cm, e.g. 170.0",
+    "weight": "weight in kg, e.g. 75.0",
+}
+
+
+def collect_manual_input(
+    feature_cols: Optional[List[str]] = None,
+    *,
+    _input_fn=input,
+) -> Dict[str, Any]:
+    """
+    Prompt the user in the terminal to enter a value for every feature
+    column, then return the collected values as a dict.
+
+    Parameters
+    ----------
+    feature_cols : list[str] | None
+        Columns to prompt for.  Defaults to ``FEATURE_COLUMNS``.
+    _input_fn : callable
+        Injected ``input()`` replacement used by tests.
+
+    Returns
+    -------
+    dict  –  ``{column_name: numeric_value, ...}``
+    """
+    if feature_cols is None:
+        feature_cols = list(FEATURE_COLUMNS)
+
+    sep = "-" * 50
+    print()
+    print(sep)
+    print("  MANUAL PREDICTION INPUT")
+    print(sep)
+    print("  Enter a value for each feature below.")
+    print()
+
+    sample: Dict[str, Any] = {}
+    for col in feature_cols:
+        hint = _FEATURE_HINTS.get(col, "")
+        prompt = f"  {col}"
+        if hint:
+            prompt += f" ({hint})"
+        prompt += ": "
+
+        while True:
+            raw = _input_fn(prompt).strip()
+            if not raw:
+                print(f"    ⚠  Please enter a value for '{col}'.")
+                continue
+            try:
+                value = float(raw)
+                # Keep as int when appropriate (age, sex)
+                if value == int(value) and col in ("age", "sex", "ecg_id"):
+                    value = int(value)
+                sample[col] = value
+                break
+            except ValueError:
+                print(f"    ⚠  Invalid number '{raw}'. Try again.")
+
+    print()
+    print("  ✓ Input collected:")
+    for k, v in sample.items():
+        print(f"    {k}: {v}")
+    print(sep)
+    print()
+    return sample
+
+
+# ---------------------------------------------------------------------------
 # Lightweight stub predictor (no heavy model weights needed)
 # ---------------------------------------------------------------------------
 

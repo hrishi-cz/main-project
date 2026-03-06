@@ -1,5 +1,5 @@
 """Inference verification package for PTB-XL dataset analysis."""
 
-from .ptb_xl_inference import PTBXLInferenceVerifier
+from .ptb_xl_inference import PTBXLInferenceVerifier, collect_manual_input
 
-__all__ = ["PTBXLInferenceVerifier"]
+__all__ = ["PTBXLInferenceVerifier", "collect_manual_input"]
