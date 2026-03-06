@@ -1575,6 +1575,11 @@ async def ws_predict(websocket: WebSocket) -> None:
         if not model_id:
             await websocket.send_json({"type": "error", "error": "model_id is required."})
             return
+        try:
+            model_id = _sanitize_model_id(model_id)
+        except HTTPException as exc:
+            await websocket.send_json({"type": "error", "error": exc.detail})
+            return
 
         raw_inputs: List[Dict[str, Any]] = body.get("inputs", [])
         if not raw_inputs:
@@ -1744,7 +1749,7 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
                                       ``models/registry/``
     ``inputs``       : List[Dict]   – list of feature dicts (one per sample)
     ``explain``      : bool         – default false; triggers Captum IG
-    ``target_class`` : int          – default 0; XAI target class index
+    ``target_class`` : int          – default -1 (auto: explain predicted class); XAI target class index
     ``n_steps``      : int          – default 50; IG integration steps
 
     RESPONSE CONTRACT
@@ -1785,6 +1790,7 @@ async def predict_multimodal(request: Request) -> Dict[str, Any]:
                     "Retrieve available model IDs from GET /model-registry."
                 ),
             )
+        model_id = _sanitize_model_id(model_id)
 
         raw_inputs: List[Dict[str, Any]] = body.get("inputs", [])
         if not raw_inputs:

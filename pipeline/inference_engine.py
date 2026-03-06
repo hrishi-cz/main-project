@@ -7,6 +7,7 @@ models/registry/{model_id}/
 ├── artifacts/
 │   ├── model_weights.pth           – _MultimodalHead state dict
 │   ├── tabular_scaler.joblib       – fitted TabularPreprocessor
+│   ├── tabular_encoder_state.pth   – trained GRN/MLP tabular encoder (optional)
 │   ├── text_tokenizer/             – HuggingFace tokenizer (optional)
 │   ├── text_encoder_state.pth      – frozen TextEncoder weights (optional)
 │   ├── image_encoder_state.pth     – frozen ImageEncoder weights (optional)
@@ -63,6 +64,7 @@ class MultimodalInferenceEngine:
     # Known fixed output dims for text/image encoders used during training
     TEXT_DIM: int  = 768   # BERT-base CLS pooled dim
     IMAGE_DIM: int = 512   # ImageEncoder projects ResNet-50 GAP (2048) → 512
+    TABULAR_ENCODER_DIM: int = 16  # GRN/MLP tabular encoder output dim
 
     # ------------------------------------------------------------------ #
     # Initialisation
@@ -93,6 +95,9 @@ class MultimodalInferenceEngine:
         self.tokenizer: Optional[Any]    = self._load_tokenizer()
         self.target_encoder: Optional[Any] = self._load_target_encoder()
 
+        # Load trained tabular encoder (GRN/MLP) if saved
+        self._tabular_encoder: Optional[nn.Module] = self._load_tabular_encoder()
+
         # Reconstruct + load the fusion head
         self._head: nn.Module
         self.input_dims: Dict[str, int]
@@ -104,6 +109,10 @@ class MultimodalInferenceEngine:
         )
         self._head.to(self.device)
         self._head.eval()
+
+        # Place tabular encoder on device if loaded
+        if self._tabular_encoder is not None:
+            self._tabular_encoder.to(self.device)
 
         # Load frozen encoders for real multimodal inference
         self._text_encoder: Optional[nn.Module] = self._load_text_encoder()
@@ -389,6 +398,53 @@ class MultimodalInferenceEngine:
             logger.warning("Could not load target_encoder: %s", exc)
             return None
 
+    def _load_tabular_encoder(self) -> Optional[nn.Module]:
+        """Load trained tabular encoder (GRN/MLP) from saved state dict + config."""
+        state_path = self.artifacts_dir / "tabular_encoder_state.pth"
+        if not state_path.exists():
+            return None
+
+        # Read encoder config to determine class and input_dim
+        enc_config = self._load_json(self.artifacts_dir / "encoder_config.json")
+        tab_cfg = enc_config.get("tabular_encoder", {}) if enc_config else {}
+        encoder_type = tab_cfg.get("type", "TabularEncoder")
+        input_dim = tab_cfg.get("input_dim")
+
+        if input_dim is None:
+            # Infer from tabular preprocessor output
+            if self.tabular_prep is not None:
+                input_dim = self.tabular_prep.get_output_dim()
+            else:
+                logger.warning(
+                    "Cannot determine tabular encoder input_dim "
+                    "– skipping tabular encoder load"
+                )
+                return None
+
+        try:
+            if encoder_type == "GRNTabularEncoder":
+                from modelss.encoders.tabular import GRNTabularEncoder
+                encoder = GRNTabularEncoder(input_dim=input_dim)
+            else:
+                from modelss.encoders.tabular import TabularEncoder
+                encoder = TabularEncoder(input_dim=input_dim)
+
+            state_dict = torch.load(state_path, map_location="cpu", weights_only=True)
+            encoder.load_state_dict(state_dict, strict=True)
+            encoder.eval()
+            for p in encoder.parameters():
+                p.requires_grad = False
+
+            logger.info(
+                "TabularEncoder loaded: type=%s  input_dim=%d  output_dim=%d",
+                encoder_type, input_dim, encoder.get_output_dim(),
+            )
+            return encoder
+
+        except Exception as exc:
+            logger.warning("Could not load TabularEncoder: %s", exc)
+            return None
+
     def _load_text_encoder(self) -> Optional[nn.Module]:
         """Load frozen TextEncoder from saved state dict or recreate from pretrained."""
         if "text" not in self.modalities:
@@ -633,6 +689,13 @@ class MultimodalInferenceEngine:
 
             batch["tabular"] = torch.tensor(arr, dtype=torch.float32)
 
+            # Run through trained tabular encoder (GRN/MLP) if available
+            if self._tabular_encoder is not None:
+                with torch.no_grad():
+                    batch["tabular"] = self._tabular_encoder(
+                        batch["tabular"].to(self.device)
+                    ).cpu()
+
         # ── Text: encode through BERT when available ────────────────────
         if "text_pooled" in self.input_dims:
             text_values: List[str] = self._extract_text_values(inputs)
@@ -712,7 +775,11 @@ class MultimodalInferenceEngine:
         """
         dims: Dict[str, int] = {}
         if self.tabular_prep is not None:
-            dims["tabular"] = self.tabular_prep.get_output_dim()
+            if self._tabular_encoder is not None:
+                # Tabular encoder projects preprocessor output to a fixed dim
+                dims["tabular"] = self._tabular_encoder.get_output_dim()
+            else:
+                dims["tabular"] = self.tabular_prep.get_output_dim()
         if "text" in self.modalities:
             dims["text_pooled"] = self.TEXT_DIM
         if "image" in self.modalities:

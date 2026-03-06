@@ -1504,10 +1504,9 @@ def render_phase_7_prediction() -> None:
             )
 
         csv_file = st.file_uploader("Feature CSV (one row = one sample)", type=["csv"], key="pred_csv")
-        st.file_uploader(
-            "Image ZIP (optional – filenames must match an 'image_path' column)",
-            type=["zip"],
-            key="pred_zip",
+        st.caption(
+            "For image columns, include file paths in the CSV. "
+            "Ensure the API server can access those paths."
         )
         if csv_file is not None:
             try:
