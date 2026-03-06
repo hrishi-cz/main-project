@@ -147,10 +147,11 @@ def main() -> None:
             print(f"  Confidence      : {confs[0]:.4f}")
             print()
             if probs and labels:
+                label_width = max(len(str(l)) for l in labels) + 2
                 print("  Class probabilities:")
                 for lbl, p in zip(labels, probs[0]):
                     bar = "█" * int(p * _BAR_WIDTH)
-                    print(f"    {str(lbl):<12} {p:.4f}  {bar}")
+                    print(f"    {str(lbl):<{label_width}} {p:.4f}  {bar}")
         print(sep)
         print()
 
