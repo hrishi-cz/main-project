@@ -219,6 +219,119 @@ class InferenceVerificationResult:
     # Overall verdict
     efficiency_verdict: str = ""
 
+    # ------------------------------------------------------------------ #
+    # Human-readable report
+    # ------------------------------------------------------------------ #
+
+    def print_report(self) -> str:
+        """
+        Return (and print) a human-readable report showing all trial
+        inputs, prediction outputs, dataset analysis, combinability
+        results, and the overall efficiency verdict.
+        """
+        sep = "=" * 72
+        thin = "-" * 72
+        lines: List[str] = []
+
+        def _add(text: str = "") -> None:
+            lines.append(text)
+
+        _add(sep)
+        _add("  PTB-XL INFERENCE VERIFICATION REPORT")
+        _add(sep)
+
+        # ── Section 1: Individual Dataset Analysis ────────────────────────
+        _add()
+        _add("1. INDIVIDUAL DATASET ANALYSIS")
+        _add(thin)
+        for label, summary in [
+            ("PTB-XL Metadata  (khyeh0719/ptb-xl-dataset)", self.ptbxl_metadata_summary),
+            ("PTB-XL ECG Image (bjoernjostein/ptb-xl-ecg-image-gmc2024)", self.ptbxl_image_summary),
+        ]:
+            _add(f"  Dataset : {label}")
+            _add(f"  Records : {summary.get('n_records', '?')}")
+            _add(f"  Columns : {summary.get('n_columns', '?')}  {summary.get('columns', [])}")
+            _add(f"  Is ECG  : {summary.get('is_ecg_dataset', '?')}")
+            _add(f"  Has Imgs: {summary.get('is_ecg_image_dataset', '?')}")
+            _add(f"  Target  : {summary.get('target_column', '?')}")
+            _add(f"  Img Cols: {summary.get('image_columns', [])}")
+            _add()
+
+        # ── Section 2: Schema Detection ───────────────────────────────────
+        _add("2. SCHEMA DETECTION")
+        _add(thin)
+        for label, schema in [
+            ("Metadata", self.ptbxl_metadata_schema),
+            ("ECG Image", self.ptbxl_image_schema),
+        ]:
+            _add(f"  [{label}]")
+            _add(f"    Problem type : {schema.get('global_problem_type', '?')}")
+            _add(f"    Primary tgt  : {schema.get('primary_target', '?')}")
+            _add(f"    Modalities   : {schema.get('global_modalities', [])}")
+            _add(f"    Fusion ready : {schema.get('fusion_ready', '?')}")
+            _add(f"    Confidence   : {schema.get('detection_confidence', '?')}")
+            _add()
+
+        # ── Section 3: Dataset Combinability ──────────────────────────────
+        _add("3. DATASET COMBINABILITY")
+        _add(thin)
+        _add(f"  Relatedness score : {self.relatedness_score:.3f}")
+        _add(f"  Threshold         : 0.500")
+        _add(f"  Combinable        : {self.datasets_combinable}")
+        pairwise = self.relatedness_report.get("pairwise_scores", {})
+        if pairwise:
+            _add(f"  Pairwise scores   : {pairwise}")
+        _add(f"  Groups            : {self.relatedness_report.get('groups', [])}")
+        _add()
+
+        # ── Section 4: Trial Inputs ───────────────────────────────────────
+        _add("4. TRIAL INPUTS")
+        _add(thin)
+        if self.trial_inputs:
+            header_keys = list(self.trial_inputs[0].keys())
+            _add(f"  {'#':<4} " + "  ".join(f"{k:<24}" for k in header_keys))
+            _add(f"  {'—'*4} " + "  ".join("—" * 24 for _ in header_keys))
+            for idx, inp in enumerate(self.trial_inputs, 1):
+                vals = "  ".join(f"{str(inp.get(k, '')):<24}" for k in header_keys)
+                _add(f"  {idx:<4} {vals}")
+        else:
+            _add("  (no trial inputs)")
+        _add()
+
+        # ── Section 5: Trial Predictions ──────────────────────────────────
+        _add("5. TRIAL PREDICTIONS")
+        _add(thin)
+        preds = self.trial_predictions
+        if preds.get("predictions"):
+            _add(f"  Class labels    : {preds.get('class_labels', [])}")
+            _add(f"  Feature columns : {preds.get('feature_columns', [])}")
+            _add()
+            _add(f"  {'#':<4} {'Prediction':<14} {'Confidence':<12} {'Probabilities'}")
+            _add(f"  {'—'*4} {'—'*14} {'—'*12} {'—'*40}")
+            predictions = preds["predictions"]
+            confidences = preds.get("confidences", [])
+            probabilities = preds.get("probabilities", [])
+            for idx in range(len(predictions)):
+                pred = predictions[idx]
+                conf = f"{confidences[idx]:.4f}" if idx < len(confidences) else "?"
+                prob_row = probabilities[idx] if idx < len(probabilities) else []
+                prob_str = "[" + ", ".join(f"{p:.4f}" for p in prob_row) + "]"
+                _add(f"  {idx+1:<4} {pred:<14} {conf:<12} {prob_str}")
+        else:
+            _add("  (no predictions)")
+        _add()
+
+        # ── Section 6: Verdict ────────────────────────────────────────────
+        _add("6. EFFICIENCY VERDICT")
+        _add(thin)
+        _add(f"  {self.efficiency_verdict}")
+        _add()
+        _add(sep)
+
+        report = "\n".join(lines)
+        print(report)
+        return report
+
 
 # ---------------------------------------------------------------------------
 # Main verifier class

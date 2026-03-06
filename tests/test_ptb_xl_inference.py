@@ -261,3 +261,50 @@ class TestFullRun:
         assert isinstance(result.relatedness_score, float)
         assert isinstance(result.datasets_combinable, bool)
         assert "n_groups" in result.relatedness_report
+
+
+# ---------------------------------------------------------------------------
+# Print report tests
+# ---------------------------------------------------------------------------
+
+
+class TestPrintReport:
+    """Verify the human-readable report output."""
+
+    def test_print_report_returns_string(self):
+        verifier = PTBXLInferenceVerifier(n_samples=50, n_trial=3)
+        result = verifier.run()
+        report = result.print_report()
+        assert isinstance(report, str)
+        assert len(report) > 0
+
+    def test_print_report_contains_sections(self):
+        verifier = PTBXLInferenceVerifier(n_samples=50, n_trial=3)
+        result = verifier.run()
+        report = result.print_report()
+        assert "INDIVIDUAL DATASET ANALYSIS" in report
+        assert "SCHEMA DETECTION" in report
+        assert "DATASET COMBINABILITY" in report
+        assert "TRIAL INPUTS" in report
+        assert "TRIAL PREDICTIONS" in report
+        assert "EFFICIENCY VERDICT" in report
+
+    def test_print_report_contains_trial_data(self):
+        verifier = PTBXLInferenceVerifier(n_samples=50, n_trial=3)
+        result = verifier.run()
+        report = result.print_report()
+        # Trial inputs should show feature names
+        assert "age" in report
+        assert "sex" in report
+        assert "height" in report
+        assert "weight" in report
+        # Predictions should show class labels
+        for label in result.trial_predictions.get("class_labels", []):
+            assert label in report
+
+    def test_print_report_contains_verdict(self):
+        verifier = PTBXLInferenceVerifier(n_samples=50, n_trial=3)
+        result = verifier.run()
+        report = result.print_report()
+        assert "checks passed" in report
+        assert "Relatedness score" in report
