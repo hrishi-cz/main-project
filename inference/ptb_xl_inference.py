@@ -165,6 +165,9 @@ def build_trial_inputs(n: int = 5) -> List[Dict[str, Any]]:
 # The feature columns the stub predictor uses for inference.
 FEATURE_COLUMNS = ["age", "sex", "height", "weight"]
 
+# Columns that should be stored as int rather than float.
+_INTEGER_COLUMNS = {"age", "sex", "ecg_id"}
+
 # Human-readable hints shown next to each prompt so the user knows what to
 # type.  Keys must match ``FEATURE_COLUMNS``.
 _FEATURE_HINTS: Dict[str, str] = {
@@ -221,8 +224,8 @@ def collect_manual_input(
                 continue
             try:
                 value = float(raw)
-                # Keep as int when appropriate (age, sex)
-                if value == int(value) and col in ("age", "sex", "ecg_id"):
+                # Keep as int when appropriate (age, sex, ecg_id)
+                if value == int(value) and col in _INTEGER_COLUMNS:
                     value = int(value)
                 sample[col] = value
                 break

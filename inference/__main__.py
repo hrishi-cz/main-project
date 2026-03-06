@@ -83,6 +83,8 @@ def main() -> None:
         probs = pred_result.get("probabilities", [])
         labels = pred_result.get("class_labels", [])
 
+        _BAR_WIDTH = 30  # max characters for the probability bar
+
         if preds:
             print(f"  Predicted class : {preds[0]}")
             print(f"  Confidence      : {confs[0]:.4f}")
@@ -90,7 +92,7 @@ def main() -> None:
             if probs and labels:
                 print("  Class probabilities:")
                 for lbl, p in zip(labels, probs[0]):
-                    bar = "█" * int(p * 30)
+                    bar = "█" * int(p * _BAR_WIDTH)
                     print(f"    {lbl:<8} {p:.4f}  {bar}")
         print(sep)
         print()
