@@ -27,7 +27,7 @@ def main() -> None:
     result.print_report()
 
     # Exit with non-zero code if not all checks passed
-    if "5/5" not in result.efficiency_verdict:
+    if result.checks_passed < result.total_checks:
         sys.exit(1)
 
 

@@ -218,6 +218,8 @@ class InferenceVerificationResult:
 
     # Overall verdict
     efficiency_verdict: str = ""
+    checks_passed: int = 0
+    total_checks: int = 0
 
     # ------------------------------------------------------------------ #
     # Human-readable report
@@ -634,6 +636,8 @@ class PTBXLInferenceVerifier:
                 "dataset only for inference."
             )
         result.efficiency_verdict = " ".join(verdict_parts)
+        result.checks_passed = checks_passed
+        result.total_checks = total_checks
 
         logger.info("=" * 70)
         logger.info("PTB-XL Inference Verification — COMPLETE")
