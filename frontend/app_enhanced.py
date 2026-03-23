@@ -237,32 +237,31 @@ def render_phase_1_data_ingestion():
 
             st.session_state.ingestion_task_id = None
 
-            # Update session state
+            # Update session state — only reset downstream if new data came in
             overall = ingestion.get("status", "failed")
-            st.session_state.dataset_uploaded = overall in ("success", "partial")
-            st.session_state.schema_detected = False
-            st.session_state.detected_schema = None
-            st.session_state.model_selected = False
-            st.session_state.training_task_id = None
-            st.session_state.hp_overrides = None
-            st.session_state.training_result = None
-            if "model_selection_result" in st.session_state:
-                del st.session_state.model_selection_result
-            if "preprocess_result" in st.session_state:
-                del st.session_state.preprocess_result
-            if "drift_result" in st.session_state:
-                del st.session_state.drift_result
-            if "registry_result" in st.session_state:
-                del st.session_state.registry_result
+            new_data = overall in ("success", "partial")
+            st.session_state.dataset_uploaded = new_data or st.session_state.dataset_uploaded
 
-            # Extract dataset shapes
+            if new_data:
+                # Only clear downstream results when fresh data actually arrived
+                st.session_state.schema_detected = False
+                st.session_state.detected_schema = None
+                st.session_state.model_selected = False
+                st.session_state.training_task_id = None
+                st.session_state.hp_overrides = None
+                st.session_state.training_result = None
+                for key in ("model_selection_result", "preprocess_result", "drift_result", "registry_result"):
+                    st.session_state.pop(key, None)
+
+            # Extract dataset shapes and show summary
             dataset_shapes = []
             for ds_info in datasets_list:
                 shape = ds_info.get("shape")
                 if shape and ds_info.get("status") == "success":
                     dataset_shapes.append(shape)
 
-            row_count = dataset_shapes[0][0] if dataset_shapes else 5000
+            successful = [d for d in datasets_list if d.get("status") == "success"]
+            row_count = dataset_shapes[0][0] if (dataset_shapes and dataset_shapes[0][0]) else 5000
             sources = [ds_info.get("source", "") for ds_info in datasets_list]
 
             st.session_state.dataset_info = {
@@ -339,22 +338,28 @@ def render_phase_1_data_ingestion():
     with col2:
         if st.button("📊 View Cache", use_container_width=True):
             try:
-                response = requests.get(f"{API_BASE_URL}/cache/stats", timeout=5)
-                if response.status_code == 200:
-                    cache_info = response.json()
-                    st.success(f"✅ Cache Location: {cache_info['cache_location']}")
+                stats_resp = requests.get(f"{API_BASE_URL}/cache/stats", timeout=5)
+                meta_resp = requests.get(f"{API_BASE_URL}/cache/metadata", timeout=5)
+                if stats_resp.status_code == 200:
+                    cache_info = stats_resp.json()
+                    meta = meta_resp.json() if meta_resp.status_code == 200 else {}
+                    st.success(f"✅ Cache: {cache_info['cache_location']}")
 
                     col_c1, col_c2, col_c3 = st.columns(3)
-                    col_c1.metric("Cached Items", cache_info['total_items'])
+                    col_c1.metric("Cached Datasets", cache_info['total_items'])
                     col_c2.metric("Total Size (MB)", cache_info['total_size_mb'])
                     col_c3.metric("Status", "Ready")
 
                     if cache_info['items']:
-                        with st.expander("📁 Cached Files"):
+                        with st.expander(f"📁 Cached Files ({len(cache_info['items'])})"):
                             for item in cache_info['items']:
-                                st.caption(f"• {item['name']} ({item['size_mb']} MB)")
+                                h = item['name']
+                                src_url = meta.get(h, {}).get("source", h)
+                                st.caption(
+                                    f"• `{h[:16]}` — {item['size_mb']} MB\n  {src_url[:100]}"
+                                )
                 else:
-                    st.error(f"Cache query failed ({response.status_code}): {response.text[:200]}")
+                    st.error(f"Cache query failed ({stats_resp.status_code}): {stats_resp.text[:200]}")
             except Exception as e:
                 st.error(f"Cannot connect to cache endpoint: {e}")
 
@@ -372,11 +377,21 @@ def render_phase_1_data_ingestion():
 
     # Status display
     if st.session_state.dataset_uploaded:
-        st.markdown("### ✅ Status")
+        info = st.session_state.dataset_info
+        st.markdown("### ✅ Ingested Datasets")
+        shapes = info.get("shapes", [])
+        sources = info.get("sources", [])
+        for i, src in enumerate(sources):
+            shape_str = ""
+            if i < len(shapes) and shapes[i]:
+                r, c = shapes[i][0], shapes[i][1] if len(shapes[i]) > 1 else "?"
+                shape_str = f" — {r:,} rows × {c} cols" if r else f" — {c} cols"
+            st.success(f"📄 **Dataset {i+1}**{shape_str}\n`{src[:120]}`")
+
         col1, col2, col3 = st.columns(3)
-        col1.metric("Datasets Loaded", st.session_state.dataset_info.get("count", 0))
-        col2.metric("Cache Location", "./data/dataset_cache/")
-        col3.metric("Last Updated", "Just now")
+        col1.metric("Datasets Loaded", len(sources))
+        col2.metric("Cache", "./data/dataset_cache/")
+        col3.metric("Rows (est.)", f"{info.get('row_count', 0):,}")
 
         if st.button("➡️ Next: Schema Detection", use_container_width=True):
             st.session_state.workflow_stage = 2

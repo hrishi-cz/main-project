@@ -231,6 +231,18 @@ async def cache_clear() -> Dict[str, Any]:
     return await asyncio.to_thread(_clear_sync)
 
 
+@app.get("/cache/metadata")
+async def cache_metadata_endpoint() -> Dict[str, Any]:
+    """Return the raw cache metadata mapping hash -> {source, timestamp, size_mb, ...}.
+    Used by the frontend to display human-readable source URLs instead of bare hashes.
+    """
+    def _meta_sync() -> Dict[str, Any]:
+        from data_ingestion.ingestion_manager import DataIngestionManager
+        mgr = DataIngestionManager()
+        return mgr.cache_metadata  # already a dict[hash -> {source, ...}]
+    return await asyncio.to_thread(_meta_sync)
+
+
 # ---------------------------------------------------------------------------
 # Ingest datasets endpoint
 # ---------------------------------------------------------------------------
@@ -279,26 +291,17 @@ async def ingest_datasets_endpoint(
     task_id = uuid.uuid4().hex[:8]
     tracker = IngestionProgressTracker(task_id, dataset_urls, task_db)
 
-    # Per-session isolation: each session_id gets its own dict.
+    # Per-session isolation: use setdefault so re-ingesting into the same
+    # session APPENDS new hashes instead of wiping previously ingested datasets.
     with _session_lock:
-        _session_store[session_id] = {}
+        if session_id not in _session_store:
+            _session_store[session_id] = {}
     session_hashes: Dict[str, Dict[str, Any]] = _session_store[session_id]
 
     async def _run_ingestion() -> None:
         try:
             tracker.set_progress(5, "Initializing ingestion pipeline...")
 
-            # Create a fresh orchestrator so dataset_registry starts empty
-            from pipeline.training_orchestrator import TrainingOrchestrator, TrainingConfig
-            orchestrator = TrainingOrchestrator(
-                TrainingConfig(
-                    dataset_sources=dataset_urls,
-                    problem_type="classification_binary",
-                    modalities=["tabular"],
-                )
-            )
-
-            # Ingest datasets one-by-one so we can report per-dataset progress
             from data_ingestion.ingestion_manager import DataIngestionManager
             manager = DataIngestionManager()
 
@@ -315,39 +318,51 @@ async def ingest_datasets_endpoint(
 
                     if lazy_datasets:
                         for source_hash, lazy_ref in lazy_datasets.items():
-                            # Register into orchestrator for session tracking
-                            orchestrator.dataset_registry.register_dataset(
-                                source_hash,
-                                lazy_ref,
-                                metadata={
-                                    "source_url": source_url,
-                                    "hash": source_hash,
-                                    "timestamp": ingest_meta["ingestion_time"],
-                                },
-                            )
-
-                            shape = orchestrator.dataset_registry.get_shape_estimate(source_hash)
+                            # ── Shape + columns from the lazy ref directly ───────────
+                            shape: Optional[List[int]] = None
                             columns: List[str] = []
                             try:
                                 import polars as pl
                                 if isinstance(lazy_ref, pl.LazyFrame):
-                                    columns = lazy_ref.collect_schema().names()
-                            except Exception:
+                                    schema = lazy_ref.collect_schema()
+                                    columns = schema.names()
+                                    try:
+                                        n_rows = int(
+                                            lazy_ref.select(pl.len()).collect().item()
+                                        )
+                                        shape = [n_rows, len(columns)]
+                                    except Exception:
+                                        shape = [None, len(columns)]  # type: ignore[list-item]
+                            except ImportError:
                                 pass
+
+                            if not columns:
+                                # Dask / pandas fallback
+                                try:
+                                    if hasattr(lazy_ref, "columns"):
+                                        columns = list(lazy_ref.columns)
+                                        try:
+                                            shape = [len(lazy_ref), len(columns)]
+                                        except Exception:
+                                            shape = [None, len(columns)]  # type: ignore[list-item]
+                                except Exception:
+                                    pass
 
                             ds_info = {
                                 "source": source_url,
                                 "hash": source_hash,
-                                "shape": list(shape) if shape is not None else None,
+                                "shape": shape,
                                 "columns": columns,
                                 "status": "success",
                             }
                             tracker.report_dataset(ds_info)
-                            session_hashes[source_hash] = {
-                                "source_url": source_url,
-                                "hash": source_hash,
-                                "timestamp": ingest_meta["ingestion_time"],
-                            }
+
+                            with _session_lock:
+                                session_hashes[source_hash] = {
+                                    "source_url": source_url,
+                                    "hash": source_hash,
+                                    "timestamp": ingest_meta["ingestion_time"],
+                                }
                     else:
                         failed = ingest_meta.get("failed", {})
                         err_msg = next(iter(failed.values()), "Unknown error") if failed else "No data returned"
