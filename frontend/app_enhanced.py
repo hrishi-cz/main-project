@@ -1,5 +1,6 @@
 """APEX AutoML Frontend - Comprehensive Multimodal ML Platform with Workflow Integration."""
 
+import uuid
 import streamlit as st
 import requests
 import json
@@ -51,6 +52,10 @@ def get_api_status():
         return None
 
 # Session state initialization
+if 'session_id' not in st.session_state:
+    # Stable unique ID for this browser tab – persisted across reruns.
+    # B1 FIX: was datetime.now().isoformat() generated fresh on every button click.
+    st.session_state.session_id = uuid.uuid4().hex[:12]
 if 'workflow_stage' not in st.session_state:
     st.session_state.workflow_stage = 1
 if 'dataset_uploaded' not in st.session_state:
@@ -59,6 +64,12 @@ if 'schema_detected' not in st.session_state:
     st.session_state.schema_detected = False
 if 'detected_schema' not in st.session_state:
     st.session_state.detected_schema = None
+if 'schema_overrides' not in st.session_state:
+    # {dataset_id: {target_column, problem_type}}
+    st.session_state.schema_overrides = {}
+if 'active_dataset_group' not in st.session_state:
+    # Index of the chosen dataset group when unrelated datasets are detected
+    st.session_state.active_dataset_group = None
 if 'model_selected' not in st.session_state:
     st.session_state.model_selected = False
 if 'dataset_info' not in st.session_state:
@@ -307,11 +318,12 @@ def render_phase_1_data_ingestion():
                 st.error("API not connected!")
             else:
                 try:
+                    # B1 FIX: use stable session_id from st.session_state (not datetime)
                     resp = requests.post(
                         f"{API_BASE_URL}/ingest/datasets",
                         json={
                             "dataset_urls": dataset_sources,
-                            "session_id": datetime.now().isoformat(),
+                            "session_id": st.session_state.session_id,
                         },
                         timeout=30,
                     )
@@ -403,10 +415,11 @@ def render_phase_2_schema_detection():
                 
                 try:
                     status.write("📍 Detecting schema for ingested datasets...")
-                    
+
+                    # B2 FIX: forward session_id so backend uses the correct session store
                     response = requests.post(
                         f"{API_BASE_URL}/detect-schema",
-                        json={},
+                        json={"session_id": st.session_state.session_id},
                         timeout=120
                     )
                     
@@ -445,33 +458,61 @@ def render_phase_2_schema_detection():
 
         schema = st.session_state.detected_schema
 
-        # ⭐ GLOBAL FIELDS (NEW ENGINE)
         global_modalities = schema.get("global_modalities", [])
         global_problem = schema.get("global_problem_type", "Unknown")
         primary_target = schema.get("primary_target", "Unknown")
         confidence = schema.get("detection_confidence", 0)
         fusion_ready = schema.get("fusion_ready", False)
+        relatedness = schema.get("relatedness_report", {})
+        n_groups = relatedness.get("n_groups", 1)
 
-        # ---------------- SUMMARY ----------------
+        # ── B5 FIX: Unrelated-dataset chooser ────────────────────────────────
+        if n_groups > 1:
+            groups = relatedness.get("groups", [])
+            st.warning(
+                f"⚠️ **{n_groups} unrelated dataset groups detected.** "
+                "The datasets share no common columns or target. "
+                "Select which group to proceed with:"
+            )
+            group_labels = [
+                f"Group {i+1} ({len(g)} dataset(s): idx {g})"
+                for i, g in enumerate(groups)
+            ]
+            chosen = st.radio(
+                "Choose dataset group",
+                options=list(range(len(groups))),
+                format_func=lambda i: group_labels[i],
+                index=st.session_state.active_dataset_group or 0,
+                key="group_chooser",
+            )
+            if st.button("✅ Use Selected Group", key="apply_group"):
+                st.session_state.active_dataset_group = chosen
+                # Filter per_dataset to the chosen group
+                chosen_indices = groups[chosen]
+                per_dataset_all = schema.get("per_dataset", [])
+                filtered_per_dataset = [per_dataset_all[i] for i in chosen_indices if i < len(per_dataset_all)]
+                schema["per_dataset"] = filtered_per_dataset
+                st.session_state.detected_schema = schema
+                st.rerun()
+
+        # ── Summary metrics ───────────────────────────────────────────────────
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Target Column", primary_target)
         col2.metric("Problem Type", global_problem)
-        col3.metric("Fusion Ready", fusion_ready)
+        col3.metric("Fusion Ready", "Yes" if fusion_ready else "No")
         col4.metric("Confidence", f"{confidence:.1%}")
 
         st.info(
             f"**Modalities Found:** {', '.join(global_modalities) if global_modalities else 'None'}"
         )
 
-        # ---------------- TABS ----------------
-        tab1, tab2 = st.tabs(["Summary", "Debug Info"])
+        # ── Tabs ──────────────────────────────────────────────────────────────
+        tab1, tab2, tab3 = st.tabs(["Summary", "Override Targets", "Debug Info"])
 
-        # ================= SUMMARY TAB =================
+        per_dataset = schema.get("per_dataset", [])
+
         with tab1:
             st.markdown("#### 📊 Per-Dataset Analysis")
-
-            per_dataset = schema.get("per_dataset", [])
-
             if not per_dataset:
                 st.warning("No per-dataset results found")
             else:
@@ -481,14 +522,76 @@ def render_phase_2_schema_detection():
                         st.write("**Target:**", ds.get("target_column"))
                         st.write("**Problem Type:**", ds.get("problem_type"))
                         st.write("**Confidence:**", ds.get("confidence"))
-
                         detected_cols = ds.get("detected_columns", {})
                         st.markdown("**Columns by Modality:**")
                         for mod, cols in detected_cols.items():
                             st.write(f"- {mod}: {len(cols)} columns")
 
-        # ================= DEBUG TAB =================
         with tab2:
+            st.markdown("#### 🎯 Override Target Columns")
+            st.caption(
+                "If the auto-detected target is wrong, select the correct column below "
+                "and click **Apply Overrides**. This updates what gets passed to preprocessing and training."
+            )
+            changed = False
+            overrides = dict(st.session_state.schema_overrides)
+            for ds in per_dataset:
+                ds_id = ds.get("dataset_id", "")
+                all_cols = []
+                for col_list in ds.get("detected_columns", {}).values():
+                    all_cols.extend(col_list)
+                auto_target = ds.get("target_column", "Unknown")
+                current_override = overrides.get(ds_id, {}).get("target_column", auto_target)
+                col_options = ["(auto) " + auto_target] + [c for c in all_cols if c != auto_target]
+                sel_idx = 0
+                if current_override != auto_target and current_override in all_cols:
+                    try:
+                        sel_idx = all_cols.index(current_override) + 1
+                    except ValueError:
+                        sel_idx = 0
+                new_target = st.selectbox(
+                    f"[{ds_id[:20]}] Target column",
+                    options=col_options,
+                    index=sel_idx,
+                    key=f"tgt_override_{ds_id}",
+                )
+                prob_opts = [
+                    "classification_binary", "classification_multiclass",
+                    "regression", "multilabel_classification", "unsupervised",
+                ]
+                auto_prob = ds.get("problem_type", "classification_binary")
+                new_prob = st.selectbox(
+                    f"[{ds_id[:20]}] Problem type",
+                    options=prob_opts,
+                    index=prob_opts.index(auto_prob) if auto_prob in prob_opts else 0,
+                    key=f"prob_override_{ds_id}",
+                )
+                resolved_target = new_target.replace("(auto) ", "") if new_target.startswith("(auto) ") else new_target
+                if resolved_target != auto_target or new_prob != auto_prob:
+                    overrides[ds_id] = {"target_column": resolved_target, "problem_type": new_prob}
+                    changed = True
+
+            if st.button("✅ Apply Overrides", key="apply_overrides", disabled=not changed):
+                st.session_state.schema_overrides = overrides
+                # Patch the detected_schema so downstream phases see the override
+                for ds in per_dataset:
+                    ds_id = ds.get("dataset_id", "")
+                    if ds_id in overrides:
+                        ds["target_column"] = overrides[ds_id].get("target_column", ds["target_column"])
+                        ds["problem_type"] = overrides[ds_id].get("problem_type", ds["problem_type"])
+                best_conf, best_target, best_prob = -1.0, "Unknown", global_problem
+                for ds in per_dataset:
+                    if ds.get("target_column", "Unknown") != "Unknown" and ds.get("confidence", 0) > best_conf:
+                        best_conf = ds["confidence"]
+                        best_target = ds["target_column"]
+                        best_prob = ds["problem_type"]
+                schema["primary_target"] = best_target
+                schema["global_problem_type"] = best_prob
+                st.session_state.detected_schema = schema
+                st.success("✅ Overrides applied and schema updated.")
+                st.rerun()
+
+        with tab3:
             st.markdown("#### 🔍 Raw Schema Detection Response")
             st.json(schema)
 
@@ -515,11 +618,13 @@ def render_phase_3_preprocessing():
             with st.spinner("Preprocessing data..."):
                 schema_data = st.session_state.detected_schema or {}
                 try:
-                    # The backend /preprocess endpoint uses session_ingested_hashes
-                    # internally and ignores request body fields. Send empty body.
+                    # B2 FIX: send session_id + schema_override so backend skips re-detect
                     response = requests.post(
                         f"{API_BASE_URL}/preprocess",
-                        json={},
+                        json={
+                            "session_id": st.session_state.session_id,
+                            "schema_override": schema_data if schema_data else None,
+                        },
                         timeout=300,
                     )
                     if response.status_code == 200:
@@ -899,6 +1004,7 @@ def render_phase_5_training():
                     return
                 schema_data = st.session_state.detected_schema or {}
                 payload = {
+                    "session_id": st.session_state.session_id,  # B4 FIX
                     "problem_type": schema_data.get("global_problem_type", "classification_binary"),
                     "modalities": schema_data.get("global_modalities", ["tabular"]),
                 }
@@ -1315,6 +1421,7 @@ def render_phase_6_monitoring():
                     resp = requests.post(
                         f"{API_BASE_URL}/monitor/drift",
                         json={
+                            "session_id": st.session_state.session_id,  # B2 FIX
                             "problem_type": schema_data.get("global_problem_type", "classification_binary"),
                             "modalities": schema_data.get("global_modalities", ["tabular"]),
                         },
@@ -1350,7 +1457,7 @@ def render_phase_6_monitoring():
         else:
             st.info("Click 'Run Drift Detection' to compute drift metrics.")
 
-    # ── Tab 3: Model registry (button-guarded, correct response shape) ───────
+    # ── Tab 3: Model registry ───────────────────────────────────────────────────
     with tab3:
         st.markdown("### Model Registry")
         if st.button("Refresh Registry", use_container_width=True, key="registry_btn"):
@@ -1370,6 +1477,48 @@ def render_phase_6_monitoring():
             display_cols = ["model_id", "created_at", "status", "deployment_ready"]
             rows = [{c: m.get(c, "") for c in display_cols} for m in models]
             st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+            # ── Model actions ─────────────────────────────────────────────
+            model_ids = [m["model_id"] for m in models]
+            sel_model = st.selectbox("🎯 Select model for actions", options=model_ids, key="reg_action_sel")
+
+            col_rename, col_dl = st.columns(2)
+
+            with col_rename:
+                st.markdown("##### ✏️ Rename Model")
+                new_name = st.text_input(
+                    "New name (letters, digits, hyphens, underscores only)",
+                    key="rename_input",
+                    placeholder="my-model-v2",
+                )
+                if st.button("✅ Apply Rename", key="do_rename", disabled=not new_name.strip()):
+                    try:
+                        r = requests.patch(
+                            f"{API_BASE_URL}/model-registry/{sel_model}/rename",
+                            json={"new_name": new_name.strip()},
+                            timeout=10,
+                        )
+                        if r.status_code == 200:
+                            st.success(f"✅ Renamed '{sel_model}' → '{new_name.strip()}'")
+                            # Refresh registry
+                            refresh = requests.get(f"{API_BASE_URL}/model-registry", timeout=10)
+                            if refresh.status_code == 200:
+                                st.session_state.registry_result = refresh.json()
+                            st.rerun()
+                        else:
+                            st.error(f"Rename failed: {r.json().get('detail', r.text[:200])}")
+                    except Exception as ex:
+                        st.error(f"Rename error: {ex}")
+
+            with col_dl:
+                st.markdown("##### ⬇️ Download Model")
+                st.caption("Downloads a zip of all model artifacts + usage README.")
+                dl_url = f"{API_BASE_URL}/model-registry/{sel_model}/download"
+                # Use an anchor link — browser navigates to the streaming endpoint directly
+                st.markdown(
+                    f'<a href="{dl_url}" target="_blank">⬇️ Download `{sel_model}`</a>',
+                    unsafe_allow_html=True,
+                )
         else:
             st.info("No models in registry. Run the full pipeline first.")
 
@@ -1383,7 +1532,7 @@ def render_phase_6_monitoring():
             st.session_state.model_selected = False
             st.rerun()
     with col2:
-        st.button("Download Model", disabled=True, help="Model download not yet implemented")
+        st.info("↑ Use the Download link in the Registry tab above")
     with col3:
         st.button("Deploy to Production", disabled=True, help="Deployment not yet implemented")
 
@@ -1811,40 +1960,40 @@ def _render_token_html(tokens: List[str], attributions: List[float]) -> str:
     )
 
 
-# Main execution
-if __name__ == "__main__":
-    # Check API connection in sidebar
-    st.sidebar.markdown("### ⚙️ System Status")
-    
-    if check_api_connection():
-        st.sidebar.success("✅ API Connected")
-        api_info = get_api_status()
-        if api_info:
-            st.sidebar.caption(f"Version: {api_info.get('version', 'N/A')}")
-            st.sidebar.caption(f"GPU: {'✅' if api_info.get('gpu_available') else '❌'}")
-    else:
-        st.sidebar.error("❌ API Disconnected")
-        st.sidebar.caption("Start API: python run_api.py")
-    
-    # Sidebar navigation
-    st.sidebar.divider()
-    st.sidebar.markdown("### 📚 Documentation")
-    
-    if st.sidebar.button("📖 Workflow Guide"):
-        st.sidebar.info("""
-        **APEX AutoML Workflow:**
-        1. Upload datasets (with caching)
-        2. Auto-detect schema & columns
-        3. Preprocess all modalities
-        4. Select models intelligently
-        5. Train with GPU acceleration
-        6. Monitor performance & drift
-        """)
-    
-    st.sidebar.markdown("### 🔗 Quick Links")
-    st.sidebar.link_button("🌐 API Docs", "http://localhost:8001/docs")
-    st.sidebar.link_button("📋 GitHub", "https://github.com/hrishi-cz/main-project")
-    
-    # Main workflow
-    render_workflow_dashboard()
+# B16 FIX: sidebar + main call unconditional (Streamlit always imports, never runs __main__)
 
+st.sidebar.markdown("### ⚙️ System Status")
+
+if check_api_connection():
+    st.sidebar.success("✅ API Connected")
+    api_info = get_api_status()
+    if api_info:
+        st.sidebar.caption(f"Version: {api_info.get('version', 'N/A')}")
+        st.sidebar.caption(f"GPU: {'✅' if api_info.get('gpu_available') else '❌'}")
+else:
+    st.sidebar.error("❌ API Disconnected")
+    st.sidebar.caption("Start API: python run_api.py")
+
+st.sidebar.divider()
+st.sidebar.markdown("### 📚 Documentation")
+
+if st.sidebar.button("📖 Workflow Guide"):
+    st.sidebar.info("""
+    **APEX AutoML Workflow:**
+    1. Upload datasets (with caching)
+    2. Auto-detect schema & columns
+    3. Preprocess all modalities
+    4. Select models intelligently
+    5. Train with GPU acceleration
+    6. Monitor performance & drift
+    7. Predict & explain
+    """)
+
+st.sidebar.markdown("### 🔗 Quick Links")
+st.sidebar.link_button("🌐 API Docs", "http://localhost:8001/docs")
+st.sidebar.link_button("📋 GitHub", "https://github.com/hrishi-cz/main-project")
+st.sidebar.divider()
+st.sidebar.caption(f"Session: `{st.session_state.session_id}`")
+
+# Main workflow
+render_workflow_dashboard()
