@@ -13,13 +13,15 @@ import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 import logging
 
 import aiohttp
 
 from data_ingestion.loader import DataLoader
+from data_ingestion.dataset_object import DatasetObject
+from data_ingestion.sampling import validate_dataset
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +35,11 @@ class DataIngestionManager:
       - DVC lineage: `dvc add <cache_path>` called after each successful cache write
     """
 
-    def __init__(self, cache_dir: str = "./data/dataset_cache") -> None:
+    def __init__(self, cache_dir: Union[str, Path] = "./data/dataset_cache") -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Mapping of str session ID -> list of successfully ingested hashes
+        self.session_datasets: Dict[str, List[str]] = {}
         self._loader = DataLoader()
         self.cache_metadata: Dict[str, Any] = self._load_cache_metadata()
 
@@ -149,17 +153,19 @@ class DataIngestionManager:
         self,
         sources: Union[str, List[str]],
         force_download: bool = False,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+    ) -> Tuple[Dict[str, DatasetObject], Dict[str, Any]]:
         """
         Concurrently ingest datasets from multiple sources.
 
         Args:
             sources:        Single URL/path or list of URLs/paths.
             force_download: Force re-download even when cached.
+            progress_callback: Optional callback for progress updates.
 
         Returns:
             Tuple:
-              - lazy_datasets : {source_hash -> LazyFrame | LazyImageDataset}
+              - datasets      : {source_hash -> DatasetObject} (standardized, validated)
               - metadata      : ingestion metadata dict (hashes, failures, timing)
         """
         if isinstance(sources, str):
@@ -173,10 +179,10 @@ class DataIngestionManager:
             "failed": {},
         }
 
-        tasks = [self._ingest_single(source, force_download) for source in sources]
+        tasks = [self._ingest_single(source, force_download, progress_callback) for source in sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        lazy_datasets: Dict[str, Any] = {}
+        datasets: Dict[str, DatasetObject] = {}
         for source, result in zip(sources, results):
             source_hash = self._generate_hash(source)
             if isinstance(result, Exception):
@@ -187,11 +193,32 @@ class DataIngestionManager:
                 logger.error("Ingestion returned None for [%s]", source)
             else:
                 lazy_ref, cache_path = result
-                lazy_datasets[source_hash] = lazy_ref
-                metadata["cached_hashes"][source] = source_hash
-                metadata["cache_status"][source] = "ok"
+                
+                # Wrap in DatasetObject with metadata
+                ingestion_meta = self.cache_metadata.get(
+                    source_hash,
+                    {"source": source, "cache_path": str(cache_path)},
+                )
+                dataset_obj = DatasetObject(
+                    dataset_id=source_hash,
+                    lazy_data=lazy_ref,
+                    metadata=ingestion_meta,
+                )
+                
+                # Validate before adding to results
+                try:
+                    validate_dataset(dataset_obj)
+                    datasets[source_hash] = dataset_obj
+                    metadata["cached_hashes"][source] = source_hash
+                    metadata["cache_status"][source] = "ok"
+                    logger.info("Dataset [%s] validated and ready", source_hash)
+                except ValueError as ve:
+                    metadata["failed"][source] = str(ve)
+                    logger.error(
+                        "Dataset validation failed for [%s]: %s", source_hash, ve
+                    )
 
-        return lazy_datasets, metadata
+        return datasets, metadata
 
     # ------------------------------------------------------------------ #
     # Per-source dispatch
@@ -201,14 +228,18 @@ class DataIngestionManager:
         self,
         source: str,
         force_download: bool,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
     ) -> Optional[Tuple[Any, Path]]:
         """
-        Ingest one source.  Returns (lazy_ref, cache_path) or raises.
+        Ingest one source.  Returns (lazy_ref, cache_path) tuple or raises.
         Exceptions propagate to asyncio.gather for per-URL isolation.
 
         Backward compatibility: if the normalised hash produces a cache miss,
         falls back to the legacy (raw-string) hash.  If found under the legacy
         key the metadata is migrated to the new normalised key in-place.
+        
+        Note: Returns raw lazy_ref here (not DatasetObject). Wrapping happens
+        in ingest_data() after all ingestion is complete.
         """
         source_hash = self._generate_hash(source)
         cache_path = self.cache_dir / source_hash
@@ -248,7 +279,7 @@ class DataIngestionManager:
 
         # Route to the right downloader
         if self._is_kaggle_url(source):
-            cache_path = await self._ingest_kaggle(source, cache_path)
+            cache_path = await self._ingest_kaggle(source, cache_path, progress_callback)
         elif source.startswith(("http://", "https://")):
             cache_path = await self._ingest_remote_url(source, cache_path)
         else:
@@ -325,13 +356,13 @@ class DataIngestionManager:
     # Kaggle downloader (sync, run in thread-pool executor)
     # ------------------------------------------------------------------ #
 
-    async def _ingest_kaggle(self, url: str, cache_path: Path) -> Path:
+    async def _ingest_kaggle(self, url: str, cache_path: Path, progress_callback: Optional[Callable[[int, str], None]] = None) -> Path:
         """Offload blocking Kaggle CLI call to a thread-pool executor."""
         return await asyncio.to_thread(
-            self._ingest_kaggle_sync, url, cache_path
+            self._ingest_kaggle_sync, url, cache_path, progress_callback
         )
 
-    def _ingest_kaggle_sync(self, url: str, cache_path: Path) -> Path:
+    def _ingest_kaggle_sync(self, url: str, cache_path: Path, progress_callback: Optional[Callable[[int, str], None]] = None) -> Path:
         """
         Synchronous Kaggle ingestion.
         Credentials are read from environment variables first, then from ~/.kaggle/kaggle.json as fallback.
@@ -372,23 +403,40 @@ class DataIngestionManager:
                 "KAGGLE_USERNAME": kaggle_username,
                 "KAGGLE_KEY": kaggle_key,
             }
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 [
                     "kaggle", "datasets", "download",
                     "-d", dataset_id,
                     "-p", str(temp_dir),
                 ],
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=1800,
                 env=env,
             )
-            if result.returncode != 0:
-                if "401" in result.stderr or "Unauthorized" in result.stderr:
+            
+            error_output = ""
+            for line in iter(proc.stdout.readline, ''):
+                error_output += line
+                if "%|" in line and progress_callback is not None:
+                    try:
+                        chunk = line.split("%")[0]
+                        pct_str = chunk.split()[-1].strip()
+                        pct = int(pct_str)
+                        if pct > 0:
+                            progress_callback(5 + int(pct * 0.8), f"Downloading {dataset_id}... {pct}%")
+                    except Exception:
+                        pass
+
+            proc.stdout.close()
+            returncode = proc.wait(timeout=1800)
+
+            if returncode != 0:
+                if "401" in error_output or "Unauthorized" in error_output:
                     raise PermissionError(
                         "Kaggle API authentication failed. Check credentials."
                     )
-                raise RuntimeError(f"kaggle CLI failed: {result.stderr}")
+                raise RuntimeError(f"kaggle CLI failed: {error_output}")
 
             zip_files = list(temp_dir.glob("*.zip"))
             if not zip_files:
@@ -405,17 +453,21 @@ class DataIngestionManager:
                                 f"ZipSlip detected: '{member}' escapes target directory"
                             )
                     zref.extractall(temp_dir)
-                zf.unlink()
-
             csv_files = list(temp_dir.rglob("*.csv"))
-            if not csv_files:
+            image_files = list(temp_dir.rglob("*.jpg")) + list(temp_dir.rglob("*.jpeg")) + list(temp_dir.rglob("*.png"))
+            
+            if not csv_files and not image_files:
                 raise RuntimeError(
-                    f"No CSV found in Kaggle archive for {dataset_id}."
+                    f"No CSV or Images found in Kaggle archive for {dataset_id}."
                 )
-
+                
             cache_path.mkdir(parents=True, exist_ok=True)
-            dest = cache_path / csv_files[0].name
-            shutil.copy2(csv_files[0], dest)
+            
+            # Universal Multimodal Extraction: move EVERYTHING from the Kaggle Zip directly to the cache folder!
+            for item in temp_dir.iterdir():
+                dest = cache_path / item.name
+                if not dest.exists():
+                    shutil.move(str(item), str(cache_path))
 
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -458,7 +510,12 @@ class DataIngestionManager:
             "timestamp": datetime.now().isoformat(),
             "cache_path": str(cache_path),
         }
-        data_files = list(cache_path.glob("*.parquet")) + list(cache_path.glob("*.csv"))
+        data_files = (
+            list(cache_path.glob("*.parquet"))
+            + list(cache_path.glob("*.csv"))
+            + list(cache_path.glob("*.xlsx"))
+            + list(cache_path.glob("*.xls"))
+        )
         if data_files:
             meta["size_mb"] = round(os.path.getsize(data_files[0]) / (1024 * 1024), 3)
         self.cache_metadata[source_hash] = meta
